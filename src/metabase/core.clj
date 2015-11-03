@@ -71,6 +71,23 @@
 
 ;;; ## ---------------------------------------- LIFECYCLE ----------------------------------------
 
+(defonce ^:private metabase-initialization-progress
+  (atom 0))
+
+(defn initialized?
+  "Metabase is initialized and ready to be served"
+  []
+  (= @metabase-initialization-progress 1.0))
+
+(defn initialization-progress
+  "Get the current progress of the Metabase initialize"
+  []
+  @metabase-initialization-progress)
+
+(defn initialization-complete!
+  "Complete the Metabase initialization by setting its progress to 100%"
+  []
+  (reset! metabase-initialization-progress 1.0))
 
 (defn- -init-create-setup-token
   "Create and set a new setup token, and open the setup URL on the user's system."
@@ -97,11 +114,15 @@
   "General application initialization function which should be run once at application startup."
   []
   (log/info (format "Starting Metabase version %s..." (config/mb-version-string)))
+  (reset! metabase-initialization-progress 0.1)
+
   ;; First of all, lets register a shutdown hook that will tidy things up for us on app exit
   (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable destroy))
+  (reset! metabase-initialization-progress 0.3)
 
   ;; startup database.  validates connection & runs any necessary migrations
   (db/setup-db :auto-migrate (config/config-bool :mb-db-automigrate))
+  (reset! metabase-initialization-progress 0.5)
 
   ;; run a very quick check to see if we are doing a first time installation
   ;; the test we are using is if there is at least 1 User in the database
@@ -109,9 +130,11 @@
 
     ;; Bootstrap the event system
     (events/initialize-events!)
+    (reset! metabase-initialization-progress 0.7)
 
     ;; Now start the task runner
     (task/start-scheduler!)
+    (reset! metabase-initialization-progress 0.8)
 
     (when new-install
       (log/info "Looks like this is a new installation ... preparing setup wizard")
@@ -119,6 +142,7 @@
       (-init-create-setup-token)
       ;; publish install event
       (events/publish-event :install {}))
+    (reset! metabase-initialization-progress 0.9)
 
     ;; deal with our sample dataset as needed
     (if new-install
@@ -128,6 +152,7 @@
       (sample-data/update-sample-dataset-if-needed!)))
 
   (log/info "Metabase Initialization COMPLETE")
+  (initialization-complete!)
   true)
 
 
@@ -141,16 +166,23 @@
   "Start the embedded Jetty web server."
   []
   (when-not @jetty-instance
-    (let [jetty-config (cond-> (m/filter-vals identity {:port (config/config-int :mb-jetty-port)
-                                                        :host (config/config-str :mb-jetty-host)
-                                                        :max-threads (config/config-int :mb-jetty-maxthreads)
-                                                        :min-threads (config/config-int :mb-jetty-minthreads)
-                                                        :max-queued (config/config-int :mb-jetty-maxqueued)
-                                                        :max-idle-time (config/config-int :mb-jetty-maxidletime)})
-                         (config/config-str :mb-jetty-join) (assoc :join? (config/config-bool :mb-jetty-join))
-                         (config/config-str :mb-jetty-daemon) (assoc :daemon? (config/config-bool :mb-jetty-daemon)))]
-      (log/info "Launching Embedded Jetty Webserver with config:\n" (with-out-str (clojure.pprint/pprint jetty-config)))
-      (->> (ring-jetty/run-jetty app jetty-config)
+    (let [jetty-ssl-config (m/filter-vals identity {:ssl-port       (config/config-int :mb-jetty-ssl-port)
+                                                    :keystore       (config/config-str :mb-jetty-ssl-keystore)
+                                                    :key-password   (config/config-str :mb-jetty-ssl-keystore-password)
+                                                    :truststore     (config/config-str :mb-jetty-ssl-truststore)
+                                                    :trust-password (config/config-str :mb-jetty-ssl-truststore-password)})
+          jetty-config     (cond-> (m/filter-vals identity {:port           (config/config-int :mb-jetty-port)
+                                                            :host           (config/config-str :mb-jetty-host)
+                                                            :max-threads    (config/config-int :mb-jetty-maxthreads)
+                                                            :min-threads    (config/config-int :mb-jetty-minthreads)
+                                                            :max-queued     (config/config-int :mb-jetty-maxqueued)
+                                                            :max-idle-time  (config/config-int :mb-jetty-maxidletime)})
+                             (config/config-str :mb-jetty-daemon) (assoc :daemon? (config/config-bool :mb-jetty-daemon))
+                             (config/config-str :mb-jetty-ssl)    (-> (assoc :ssl? true)
+                                                                      (merge jetty-ssl-config)))]
+      (log/info "Launching Embedded Jetty Webserver with config:\n" (with-out-str (clojure.pprint/pprint (m/filter-keys (fn [k] (not (re-matches #".*password.*" (str k)))) jetty-config))))
+      ;; NOTE: we always start jetty w/ join=false so we can start the server first then do init in the background
+      (->> (ring-jetty/run-jetty app (assoc jetty-config :join? false))
            (reset! jetty-instance)))))
 
 (defn stop-jetty
@@ -168,10 +200,13 @@
 (defn- start-normally []
   (log/info "Starting Metabase in STANDALONE mode")
   (try
+    ;; launch embedded webserver async
+    (start-jetty)
     ;; run our initialization process
     (init)
-    ;; launch embedded webserver
-    (start-jetty)
+    ;; Ok, now block forever while Jetty does its thing
+    (when (config/config-bool :mb-jetty-join)
+      (.join ^org.eclipse.jetty.server.Server @jetty-instance))
     (catch Exception e
       (.printStackTrace e)
       (log/error "Metabase Initialization FAILED: " (.getMessage e)))))

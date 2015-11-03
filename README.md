@@ -21,7 +21,7 @@ You can run Metabase in two primary ways, as a docker container or as a jar.
 
 To run Metabase via Docker, just type
 
-	docker run -d -p 3000:3000 —name metabase metabase/metabase
+	docker run -d -p 3000:3000 --name metabase metabase/metabase
 
 
 ## JVM Jar
@@ -32,9 +32,9 @@ To run the jar you will need to have a Java Runtime installed. As a quick check 
 
 If you see something like
 
-    java version "1.8.0_31"
-    Java(TM) SE Runtime Environment (build 1.8.0_31-b13)
-    Java HotSpot(TM) 64-Bit Server VM (build 25.31-b07, mixed mode)
+    java version "1.8.0_51"
+    Java(TM) SE Runtime Environment (build 1.8.0_51-b16)
+    Java HotSpot(TM) 64-Bit Server VM (build 25.51-b03, mixed mode)
 
 you are good to go. Otherwise, download the Java Runtime Environment at http://java.com/
 
@@ -67,6 +67,6 @@ Metabase also allows you to hit our Query API directly from Javascript to integr
 
 Unless otherwise noted, all Metabase source files are made available under the terms of the GNU Affero General Public License (AGPL).
 
-See [LICENSE.txt](https://github.com/metabase/metabase/blob/master/LICENSE.txt) for details.
+See [LICENSE.txt](https://github.com/metabase/metabase/blob/master/LICENSE.txt) for details and exceptions.
 
 Unless otherwise noted, all files © 2015 Metabase, Inc.
