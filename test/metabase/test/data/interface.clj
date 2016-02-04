@@ -5,6 +5,7 @@
    actual physical RDMS database. This functionality allows us to easily test with multiple datasets."
   (:require [clojure.string :as s]
             [metabase.db :refer :all]
+            [metabase.driver :as driver]
             (metabase.models [database :refer [Database]]
                              [field :refer [Field] :as field]
                              [table :refer [Table]]))
@@ -60,32 +61,56 @@
 ;; ## IDatasetLoader
 
 (defprotocol IDatasetLoader
-  "Methods for creating, deleting, and populating *pyhsical* DBMS databases, tables, and fields."
+  "Methods for creating, deleting, and populating *pyhsical* DBMS databases, tables, and fields.
+   Methods marked *OPTIONAL* have default implementations in `IDatasetLoaderDefaultsMixin`."
   (engine [this]
     "Return the engine keyword associated with this database, e.g. `:h2` or `:mongo`.")
 
-  (database->connection-details [this ^DatabaseDefinition database-definition]
-    "Return the connection details map that should be used to connect to this database.")
+  (database->connection-details [this ^Keyword context, ^DatabaseDefinition database-definition]
+    "Return the connection details map that should be used to connect to this database (i.e. a Metabase `Database` details map)
+     CONTEXT is one of:
 
-  ;; create-physical-database, etc.
-  (create-physical-db! [this ^DatabaseDefinition database-definition]
-    "Create a new database from DATABASE-DEFINITION, including adding tables, fields, and foreign key constraints.
-     This refers to the actual *DBMS* database itself, *not* a Metabase `Database` object.
-     This method should *not* add data to the database, create any metabase objects (such as `Database`), or trigger syncing.")
+     *  `:server` - Return details for making the connection in a way that isn't DB-specific (e.g., for creating/destroying databases)
+     *  `:db`     - Return details for connecting specifically to the DB.")
 
-  (drop-physical-db! [this ^DatabaseDefinition database-definition]
+  (create-db! [this ^DatabaseDefinition database-definition]
+    "Create a new database from DATABASE-DEFINITION, including adding tables, fields, and foreign key constraints,
+     and add the appropriate data. This method should drop existing databases with the same name if applicable.
+     (This refers to creating the actual *DBMS* database itself, *not* a Metabase `Database` object.)")
+
+  (destroy-db! [this ^DatabaseDefinition database-definition]
     "Destroy database, if any, associated with DATABASE-DEFINITION.
      This refers to destroying a *DBMS* database -- removing an H2 file, dropping a Postgres database, etc.
      This does not need to remove corresponding Metabase definitions -- this is handled by `DatasetLoader`.")
 
-  (create-physical-table! [this ^DatabaseDefinition database-definition, ^TableDefinition table-definition]
-    "Create a new DBMS table/collection/etc for TABLE-DEFINITION. Don't load any data.")
+  (default-schema [this]
+    "*OPTIONAL* Return the default schema name that tables for this DB should be expected to have.")
 
-  (load-table-data! [this ^DatabaseDefinition database-definition, ^TableDefinition table-definition]
-    "Load data for the DMBS table/collection/etc. corresponding to TABLE-DEFINITION.")
+  (expected-base-type->actual [this base-type]
+    "*OPTIONAL*. Return the base type type that is actually used to store `Fields` of BASE-TYPE.
+     The default implementation of this method is an identity fn. This is provided so DBs that don't support a given BASE-TYPE used in the test data
+     can specifiy what type we should expect in the results instead.
+     For example, Oracle has `INTEGER` data types, so `:IntegerField` test values are instead stored as `NUMBER`, which we map to `:DecimalField`.")
 
-  (drop-physical-table! [this ^DatabaseDefinition database-definition, ^TableDefinition table-definition]
-    "Drop the DBMS table/collection/etc. associated with TABLE-DEFINITION."))
+  (format-name [this table-or-field-name]
+    "*OPTIONAL* Transform a lowercase string `Table` or `Field` name in a way appropriate for this dataset
+     (e.g., `h2` would want to upcase these names; `mongo` would want to use `\"_id\"` in place of `\"id\"`.")
+
+  (has-questionable-timezone-support? [this]
+    "*OPTIONAL*. Does this driver have \"questionable\" timezone support? (i.e., does it group things by UTC instead of the `US/Pacific` when we're testing?)
+     Defaults to `(not (contains? (metabase.driver/features this) :set-timezone)`")
+
+  (id-field-type [this]
+    "*OPTIONAL* Return the `base_type` of the `id` `Field` (e.g. `:IntegerField` or `:BigIntegerField`). Defaults to `:IntegerField`."))
+
+(def IDatasetLoaderDefaultsMixin
+  {:expected-base-type->actual         (fn [_ base-type] base-type)
+   :default-schema                     (constantly nil)
+   :format-name                        (fn [_ table-or-field-name]
+                                         table-or-field-name)
+   :has-questionable-timezone-support? (fn [driver]
+                                         (not (contains? (driver/features driver) :set-timezone)))
+   :id-field-type                      (constantly :IntegerField)})
 
 
 ;; ## Helper Functions for Creating New Definitions
@@ -127,3 +152,71 @@
   `(def ~(vary-meta dataset-name assoc :tag DatabaseDefinition)
      (create-database-definition ~(name dataset-name)
        ~@table-name+field-definition-maps+rows)))
+
+
+
+;;; ## Convenience + Helper Functions
+;; TODO - should these go here, or in `metabase.test.data`?
+
+(defn get-tabledef
+  "Return `TableDefinition` with TABLE-NAME in DBDEF."
+  [^DatabaseDefinition dbdef, ^String table-name]
+  (first (for [tabledef (:table-definitions dbdef)
+               :when    (= (:table-name tabledef) table-name)]
+           tabledef)))
+
+(defn get-fielddefs
+  "Return the `FieldDefinitions` associated with table with TABLE-NAME in DBDEF."
+  [^DatabaseDefinition dbdef, ^String table-name]
+  (:field-definitions (get-tabledef dbdef table-name)))
+
+(defn dbdef->table->id->k->v
+  "Return a map of table name -> map of row ID -> map of column key -> value."
+  [^DatabaseDefinition dbdef]
+  (into {} (for [{:keys [table-name field-definitions rows]} (:table-definitions dbdef)]
+             {table-name (let [field-names (map :field-name field-definitions)]
+                           (->> rows
+                                (map (partial zipmap field-names))
+                                (map-indexed (fn [i row]
+                                               {(inc i) row}))
+                                (into {})))})))
+
+(defn- nest-fielddefs [^DatabaseDefinition dbdef, ^String table-name]
+  (let [nest-fielddef (fn nest-fielddef [{:keys [fk field-name], :as fielddef}]
+                        (if-not fk
+                          [fielddef]
+                          (let [fk (name fk)]
+                            (for [nested-fielddef (mapcat nest-fielddef (get-fielddefs dbdef fk))]
+                              (update nested-fielddef :field-name (partial vector field-name fk))))))]
+    (mapcat nest-fielddef (get-fielddefs dbdef table-name))))
+
+(defn- flatten-rows [^DatabaseDefinition dbdef, ^String table-name]
+  (let [nested-fielddefs (nest-fielddefs dbdef table-name)
+        table->id->k->v  (dbdef->table->id->k->v dbdef)
+        resolve-field    (fn resolve-field [table id field-name]
+                           (if (string? field-name)
+                             (get-in table->id->k->v [table id field-name])
+                             (let [[fk-from-name fk-table fk-dest-name] field-name
+                                   fk-id                                (get-in table->id->k->v [table id fk-from-name])]
+                               (resolve-field fk-table fk-id fk-dest-name))))]
+    (for [id (range 1 (inc (count (:rows (get-tabledef dbdef table-name)))))]
+      (for [{:keys [field-name]} nested-fielddefs]
+        (resolve-field table-name id field-name)))))
+
+(defn- flatten-field-name [field-name]
+  (if (string? field-name)
+    field-name
+    (let [[_ fk-table fk-dest-name] field-name]
+      (-> fk-table
+          (clojure.string/replace #"ies$" "y")
+          (clojure.string/replace #"s$" "")
+          (str  \_ (flatten-field-name fk-dest-name))))))
+
+(defn flatten-dbdef
+  "Create a flattened version of DBDEF by following resolving all FKs and flattening all rows into the table with TABLE-NAME."
+  [^DatabaseDefinition dbdef, ^String table-name]
+  (create-database-definition (:database-name dbdef)
+    [table-name
+     (for [fielddef (nest-fielddefs dbdef table-name)]
+       (update fielddef :field-name flatten-field-name))
+     (flatten-rows dbdef table-name)]))

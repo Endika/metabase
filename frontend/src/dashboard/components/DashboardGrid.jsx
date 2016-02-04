@@ -2,6 +2,7 @@ import React, { Component, PropTypes } from "react";
 
 import { Responsive as ResponsiveReactGridLayout } from "react-grid-layout";
 
+import MetabaseAnalytics from "metabase/lib/analytics";
 import Icon from "metabase/components/Icon.jsx";
 import DashCard from "./DashCard.jsx";
 import Modal from "metabase/components/Modal.jsx";
@@ -29,7 +30,6 @@ export default class DashboardGrid extends Component {
         dispatch: PropTypes.func.isRequired,
         isEditing: PropTypes.bool.isRequired,
         dashboard: PropTypes.object.isRequired,
-        visualizationSettingsApi: PropTypes.object.isRequired,
         onChangeLocation: PropTypes.func.isRequired
     };
 
@@ -56,6 +56,10 @@ export default class DashboardGrid extends Component {
             change.dashcard.row = change.y;
             change.dashcard.sizeX = change.w;
             change.dashcard.sizeY = change.h;
+        }
+
+        if (changes && changes.length > 0) {
+            MetabaseAnalytics.trackEvent("Dashboard", "Layout Changed");
         }
     }
 
@@ -143,7 +147,7 @@ export default class DashboardGrid extends Component {
     render() {
         var { dashboard } = this.props;
         return (
-            <div className="flex-full full">
+            <div>
                 <ResponsiveReactGridLayout
                     className={cx("DashboardGrid", { "Dash--editing": this.props.isEditing, "Dash--dragging": this.state.isDragging })}
                     breakpoints={{lg: 753, sm: 752}}
@@ -169,13 +173,12 @@ export default class DashboardGrid extends Component {
                                 key={dc.id}
                                 dashcard={dc}
                                 dispatch={this.props.dispatch}
-                                visualizationSettingsApi={this.props.visualizationSettingsApi}
                             />
                             <div className="DashCard-actions absolute top right text-brand p1">
                                 <a href="#" onClick={() => this.onEditDashCard(dc)}>
                                     <Icon className="m1" name="pencil" width="24" height="24" />
                                 </a>
-                                <a href="#" onClick={() => this.setState({ removeModalDashCard: dc })}>
+                                <a data-metabase-event="Dashboard;Remove Card Modal" href="#" onClick={() => this.setState({ removeModalDashCard: dc })}>
                                     <Icon className="m1" name="trash" width="24" height="24" />
                                 </a>
                             </div>

@@ -8,49 +8,55 @@
             [metabase.test.data.users :refer :all]
             [metabase.test.util :refer [match-$ expect-eval-actual-first]]))
 
+;; Helper Fns
+
+(defn- db-details []
+  (match-$ (db)
+    {:created_at      $
+     :engine          "h2"
+     :id              $
+     :updated_at      $
+     :name            "test-data"
+     :is_sample       false
+     :is_full_sync    true
+     :organization_id nil
+     :description     nil
+     :features        (mapv name (metabase.driver/features (metabase.driver/engine->driver :h2)))}))
 
 
 ;; ## GET /api/field/:id
 (expect
     (match-$ (Field (id :users :name))
-      {:description nil
-       :table_id (id :users)
-       :table (match-$ (Table (id :users))
-                {:description nil
-                 :entity_type nil
-                 :visibility_type nil
-                 :db (match-$ (db)
-                       {:created_at $
-                        :engine "h2"
-                        :id $
-                        :updated_at $
-                        :name "Test Database"
-                        :is_sample false
-                        :organization_id nil
-                        :description nil})
-                 :name "USERS"
-                 :display_name "Users"
-                 :rows 15
-                 :updated_at $
-                 :entity_name nil
-                 :active true
-                 :id (id :users)
-                 :db_id (db-id)
-                 :created_at $})
-       :special_type "category" ; metabase.driver.generic-sql.sync/check-for-low-cardinality should have marked this as such because it had no other special_type
-       :name "NAME"
-       :display_name "Name"
-       :updated_at $
-       :active true
-       :id (id :users :name)
-       :field_type "info"
-       :position 0
+      {:description     nil
+       :table_id        (id :users)
+       :table           (match-$ (Table (id :users))
+                          {:description     nil
+                           :entity_type     nil
+                           :visibility_type nil
+                           :db              (db-details)
+                           :schema          "PUBLIC"
+                           :name            "USERS"
+                           :display_name    "Users"
+                           :rows            15
+                           :updated_at      $
+                           :entity_name     nil
+                           :active          true
+                           :id              (id :users)
+                           :db_id           (id)
+                           :created_at      $})
+       :special_type    "name"
+       :name            "NAME"
+       :display_name    "Name"
+       :updated_at      $
+       :active          true
+       :id              (id :users :name)
+       :field_type      "info"
+       :position        0
        :preview_display true
        :created_at      $
        :base_type       "TextField"
-       :parent_id       nil
-       :parent          nil})
-  ((user->client :rasta) :get 200 (format "field/%d" (id :users :name))))
+       :parent_id       nil})
+    ((user->client :rasta) :get 200 (format "field/%d" (id :users :name))))
 
 
 ;; ## GET /api/field/:id/summary
@@ -81,8 +87,7 @@
               :preview_display true
               :created_at      $
               :base_type       "FloatField"
-              :parent_id       nil
-              :parent          nil})
+              :parent_id       nil})
   ((user->client :crowberto) :put 200 (format "field/%d" (id :venues :latitude)) {:special_type :fk}))
 
 (defn- field->field-values

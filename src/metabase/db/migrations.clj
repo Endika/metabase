@@ -3,8 +3,12 @@
   (:require [clojure.tools.logging :as log]
             [korma.core :as k]
             [metabase.db :as db]
-            (metabase.models [card :refer [Card]]
+            [metabase.events.activity-feed :refer [activity-feed-topics]]
+            (metabase.models [activity :refer [Activity]]
+                             [card :refer [Card]]
                              [database :refer [Database]]
+                             [foreign-key :refer [ForeignKey]]
+                             [table :refer [Table]]
                              [setting :as setting])
             [metabase.sample-data :as sample-data]
             [metabase.util :as u]))
@@ -66,3 +70,41 @@
 (defmigration set-mongodb-databases-ssl-false
   (doseq [{:keys [id details]} (db/sel :many :fields [Database :id :details] :engine "mongo")]
     (db/upd Database id, :details (assoc details :ssl false))))
+
+
+;; Set default values for :schema in existing tables now that we've added the column
+;; That way sync won't get confused next time around
+(defmigration set-default-schemas
+  (doseq [[engine default-schema] [["postgres" "public"]
+                                   ["h2"       "PUBLIC"]]]
+    (k/update Table
+              (k/set-fields {:schema default-schema})
+              (k/where      {:schema nil
+                             :db_id  [in (k/subselect Database
+                                                      (k/fields :id)
+                                                      (k/where {:engine engine}))]}))))
+
+
+;; Populate the initial value for the `:admin-email` setting for anyone who hasn't done it yet
+(defmigration set-admin-email
+  (when-not (setting/get :admin-email)
+    (when-let [email (db/sel :one :field ['User :email] (k/where {:is_superuser true :is_active true}))]
+      (setting/set :admin-email email))))
+
+
+;; Remove old `database-sync` activity feed entries
+(defmigration remove-database-sync-activity-entries
+  (when-not (contains? activity-feed-topics :database-sync-begin)
+    (k/delete Activity
+      (k/where {:topic "database-sync"}))))
+
+
+;; Clean up duplicate FK entries
+(defmigration remove-duplicate-fk-entries
+  (let [existing-fks (db/sel :many ForeignKey)
+        grouped-fks  (group-by #(str (:origin_id %) "_" (:destination_id %)) existing-fks)]
+    (doseq [[k fks] grouped-fks]
+      (when (< 1 (count fks))
+        (log/debug "Removing duplicate FK entries for" k)
+        (doseq [duplicate-fk (drop-last fks)]
+          (db/del ForeignKey :id (:id duplicate-fk)))))))

@@ -1,9 +1,11 @@
+
+import { registerAnalyticsClickListener } from "metabase/lib/analytics";
+
 // Declare app level module which depends on filters, and services
 var Metabase = angular.module('metabase', [
     'ngRoute',
     'ngCookies',
     'ui.bootstrap', // bootstrap LIKE widgets via angular directives
-    'metabase.activity.services',
     'metabase.auth',
     'metabase.filters',
     'metabase.directives',
@@ -12,12 +14,14 @@ var Metabase = angular.module('metabase', [
     'metabase.card',
     'metabase.dashboard',
     'metabase.home',
-    'metabase.user',
+    'metabase.pulse',
     'metabase.setup',
-    'metabaseadmin.databases',
-    'metabaseadmin.people',
-    'metabaseadmin.settings',
-    'metabase.admin.metadata',
+    'metabase.user',
+    'metabase.admin',
+    'metabase.admin.databases',
+    'metabase.admin.people',
+    'metabase.admin.settings',
+    'metabase.admin.datamodel',
 ]);
 Metabase.config(['$routeProvider', '$locationProvider', function($routeProvider, $locationProvider) {
     $locationProvider.html5Mode({
@@ -52,4 +56,7 @@ Metabase.config(['$routeProvider', '$locationProvider', function($routeProvider,
 Metabase.run(["AppState", function(AppState) {
     // initialize app state
     AppState.init();
+
+    // start our analytics click listener
+    registerAnalyticsClickListener();
 }]);

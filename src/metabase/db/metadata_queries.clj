@@ -1,37 +1,54 @@
 (ns metabase.db.metadata-queries
   "Predefined QP queries for getting metadata about an external database."
   (:require [metabase.driver :as driver]
+            [metabase.driver.query-processor.expand :as ql]
+            [metabase.models.field :as field]
             [metabase.util :as u]))
 
-;; TODO - These queries have to be evaluated by the query processor and macroexpanded at runtime every time they're ran.
-;; It would be more efficient if we could let the QP could macroexpand normally for predefined queries like these
+(defn- qp-query [db-id query]
+  (-> (driver/process-query
+       {:type     :query
+        :database db-id
+        :query    query})
+      :data
+      :rows))
 
 (defn- field-query [field query]
-  (->> (driver/process-query
-        {:type :query
-         :database ((u/deref-> field :table :db) :id)
-         :query (assoc query
-                       :source_table ((u/deref-> field :table) :id))})
-       :data
-       :rows))
+  (let [table (field/table field)]
+    (qp-query (:db_id table)
+              (ql/query (merge query)
+                        (ql/source-table (:id table))))))
+
+(defn table-row-count
+  "Fetch the row count of TABLE via the query processor."
+  [table]
+  {:pre  [(map? table)]
+   :post [(integer? %)]}
+  (-> (qp-query (:db_id table) (ql/query (ql/source-table (:id table))
+                                         (ql/aggregation (ql/count))))
+      first first long))
 
 (defn field-distinct-values
-  "Return the distinct values of FIELD."
-  [{field-id :id :as field}]
-  (->> (field-query field {:aggregation ["rows"]  ; should we add a limit here? In case someone is dumb and tries to get millions of distinct values?
-                           :breakout [field-id]}) ; or should we let them do it
-       (map first)))
+  "Return the distinct values of FIELD.
+   This is used to create a `FieldValues` object for `:category` Fields."
+  ([field]
+    (field-distinct-values field @(resolve 'metabase.driver.sync/low-cardinality-threshold)))
+  ([{field-id :id :as field} max-results]
+   {:pre [(integer? max-results)]}
+   (mapv first (field-query field (-> {}
+                                      (ql/breakout (ql/field-id field-id))
+                                      (ql/limit max-results))))))
 
 (defn field-distinct-count
   "Return the distinct count of FIELD."
-  [{field-id :id :as field}]
-  (->> (field-query field {:aggregation ["distinct" field-id]})
-       first
-       first))
+  [{field-id :id :as field} & [limit]]
+  (-> (field-query field (-> {}
+                             (ql/aggregation (ql/distinct (ql/field-id field-id)))
+                             (ql/limit limit)))
+      first first int))
 
 (defn field-count
   "Return the count of FIELD."
   [{field-id :id :as field}]
-  (->> (field-query field {:aggregation ["count" field-id]})
-       first
-       first))
+  (-> (field-query field (ql/aggregation {} (ql/count (ql/field-id field-id))))
+      first first int))

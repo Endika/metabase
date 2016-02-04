@@ -18,7 +18,6 @@
   (str "http://localhost:" (config/config-str :mb-jetty-port) "/api/"))
 
 (defn
-  ^{:arglists ([credentials? method expected-status-code? url http-body-map? & url-kwargs])}
   client
   "Perform an API call and return the response (for test purposes).
    The first arg after URL will be passed as a JSON-encoded body if it is a map.
@@ -38,6 +37,7 @@
    *  URL                   Base URL of the request, which will be appended to `*url-prefix*`. e.g. `card/1/favorite`
    *  HTTP-BODY-MAP         Optional map to send a the JSON-serialized HTTP body of the request
    *  URL-KWARGS            key-value pairs that will be encoded and added to the URL as GET params"
+  {:arglists '([credentials? method expected-status-code? url http-body-map? & url-kwargs])}
   [& args]
   (let [[credentials [method & args]] (u/optional #(or (map? %)
                                                        (string? %)) args)
@@ -111,7 +111,7 @@
     (catch Exception e
       (log/error "Failed to authenticate with email:" email "and password:" password ". Does user exist?"))))
 
-(defn build-url [url url-param-kwargs]
+(defn- build-url [url url-param-kwargs]
   {:pre [(string? url)
          (or (nil? url-param-kwargs)
              (map? url-param-kwargs))]}
@@ -131,11 +131,6 @@
 (def auto-deserialize-dates-keys
   #{:created_at :updated_at :last_login :date_joined :started_at :finished_at})
 
-(defn- deserialize-date [date]
-  (some->> (u/parse-iso8601 date)
-           .getTime
-           java.sql.Timestamp.))
-
 (defn- auto-deserialize-dates
   "Automatically recurse over RESPONSE and look for keys that are known to correspond to dates.
    Parse their values and convert to `java.sql.Timestamps`."
@@ -144,7 +139,7 @@
         (map? response) (->> response
                              (map (fn [[k v]]
                                     {k (cond
-                                         (contains? auto-deserialize-dates-keys k) (deserialize-date v)
+                                         (contains? auto-deserialize-dates-keys k) (u/->Timestamp v)
                                          (coll? v) (auto-deserialize-dates v)
                                          :else v)}))
                              (into {}))

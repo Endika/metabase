@@ -6,13 +6,18 @@
                           [dashboard :as dashboard]
                           [database :as database]
                           [dataset :as dataset]
+                          [email :as email]
                           [field :as field]
                           [foreignkey :as fk]
+                          [metric :as metric]
                           [notify :as notify]
+                          [pulse :as pulse]
                           [revision :as revision]
+                          [segment :as segment]
                           [session :as session]
                           [setting :as setting]
                           [setup :as setup]
+                          [slack :as slack]
                           [table :as table]
                           [tiles :as tiles]
                           [user :as user]
@@ -33,16 +38,21 @@
   (context "/dashboard"    [] (+auth dashboard/routes))
   (context "/database"     [] (+auth database/routes))
   (context "/dataset"      [] (+auth dataset/routes))
+  (context "/email"        [] (+auth email/routes))
   (context "/field"        [] (+auth field/routes))
   (context "/foreignkey"   [] (+auth fk/routes))
   (GET     "/health"       [] (if ((resolve 'metabase.core/initialized?))
-                                  {:status 200 :body {:status "ok"}}
-                                  {:status 503 :body {:status "initializing" :progress ((resolve 'metabase.core/initialization-progress))}}))
+                                {:status 200 :body {:status "ok"}}
+                                {:status 503 :body {:status "initializing" :progress ((resolve 'metabase.core/initialization-progress))}}))
+  (context "/metric"       [] (+auth metric/routes))
   (context "/notify"       [] (+apikey notify/routes))
+  (context "/pulse"        [] (+auth pulse/routes))
   (context "/revision"     [] (+auth revision/routes))
+  (context "/segment"      [] (+auth segment/routes))
   (context "/session"      [] session/routes)
   (context "/setting"      [] (+auth setting/routes))
   (context "/setup"        [] setup/routes)
+  (context "/slack"        [] (+auth slack/routes))
   (context "/table"        [] (+auth table/routes))
   (context "/tiles"        [] (+auth tiles/routes))
   (context "/user"         [] (+auth user/routes))

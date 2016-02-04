@@ -24,7 +24,7 @@
 
 ;; ## DB FILE, JDBC/KORMA DEFINITONS
 
-(def ^:private db-file
+(def db-file
   "Path to our H2 DB file from env var or app config."
   ;; see http://h2database.com/html/features.html for explanation of options
   (delay (if (config/config-bool :mb-db-in-memory)
@@ -54,7 +54,7 @@
                    codec/form-decode
                    walk/keywordize-keys))))
 
-(def ^:private db-connection-details
+(def db-connection-details
   "Connection details that can be used when pretending the Metabase DB is itself a `Database`
    (e.g., to use the Generic SQL driver functions on the Metabase DB itself)."
   (delay (or (when-let [uri (config/config-str :mb-db-connection-uri)]
@@ -75,14 +75,16 @@
                           :user     (config/config-str :mb-db-user)
                           :password (config/config-str :mb-db-pass)}))))
 
-(def ^:private jdbc-connection-details
-  "Connection details for Korma / JDBC."
-  (delay (let [details @db-connection-details]
-           (case (:type details)
-             :h2       (kdb/h2 (assoc details :naming {:keys   s/lower-case
+(defn jdbc-details
+  "Takes our own MB details map and formats them properly for connection details for Korma / JDBC."
+  [db-details]
+  {:pre [(map? db-details)]}
+  ;; TODO: it's probably a good idea to put some more validation here and be really strict about what's in `db-details`
+  (case (:type db-details)
+    :h2       (kdb/h2       (assoc db-details :naming {:keys   s/lower-case
                                                        :fields s/upper-case}))
-             :mysql    (kdb/mysql (assoc details :db (:dbname details)))
-             :postgres (kdb/postgres (assoc details :db (:dbname details)))))))
+    :mysql    (kdb/mysql    (assoc db-details :db (:dbname db-details)))
+    :postgres (kdb/postgres (assoc db-details :db (:dbname db-details)))))
 
 
 ;; ## MIGRATE
@@ -100,24 +102,22 @@
    *  `:release-locks` - Manually release migration locks left by an earlier failed migration.
                          (This shouldn't be necessary now that we run migrations inside a transaction,
                          but is available just in case)."
-  ([direction]
-   (migrate @jdbc-connection-details direction))
-  ([jdbc-connection-details direction]
-   (try
-     (jdbc/with-db-transaction [conn jdbc-connection-details]
-       (let [^Database  database  (-> (DatabaseFactory/getInstance)
-                                      (.findCorrectDatabaseImplementation (JdbcConnection. (jdbc/get-connection conn))))
-             ^Liquibase liquibase (Liquibase. changelog-file (ClassLoaderResourceAccessor.) database)]
-         (case direction
-           :up            (.update liquibase "")
-           :down          (.rollback liquibase 10000 "")
-           :down-one      (.rollback liquibase 1 "")
-           :print         (let [writer (StringWriter.)]
-                            (.update liquibase "" writer)
-                            (.toString writer))
-           :release-locks (.forceReleaseLocks liquibase))))
-     (catch Throwable e
-       (throw (DatabaseException. e))))))
+  [db-details direction]
+  (try
+    (jdbc/with-db-transaction [conn (jdbc-details db-details)]
+      (let [^Database database (-> (DatabaseFactory/getInstance)
+                                   (.findCorrectDatabaseImplementation (JdbcConnection. (jdbc/get-connection conn))))
+            ^Liquibase liquibase (Liquibase. changelog-file (ClassLoaderResourceAccessor.) database)]
+        (case direction
+          :up            (.update liquibase "")
+          :down          (.rollback liquibase 10000 "")
+          :down-one      (.rollback liquibase 1 "")
+          :print         (let [writer (StringWriter.)]
+                           (.update liquibase "" writer)
+                           (.toString writer))
+          :release-locks (.forceReleaseLocks liquibase))))
+    (catch Throwable e
+      (throw (DatabaseException. e)))))
 
 
 ;; ## SETUP-DB
@@ -127,8 +127,8 @@
 
 (def ^:dynamic *allow-potentailly-unsafe-connections*
   "We want to make *every* database connection made by the drivers safe -- read-only, only connect if DB file exists, etc.
-   At the same time, we'd like to be able to use driver functionality like `can-connect?` to check whether we can connect
-   to the Metabase database, in which case we'd like to allow connections to databases that don't exist.
+   At the same time, we'd like to be able to use driver functionality like `can-connect-with-details?` to check whether we can
+   connect to the Metabase database, in which case we'd like to allow connections to databases that don't exist.
 
    So we need some way to distinguish the Metabase database from other databases. We could add a key to the details map
    specifying that it's the Metabase DB, but what if some shady user added that key to another database?
@@ -141,30 +141,33 @@
    forever after, making all other connnections \"safe\"."
   false)
 
-(defn- db-can-connect? [details]
-  (binding [*allow-potentailly-unsafe-connections* true]
-    ((u/runtime-resolved-fn 'metabase.driver 'can-connect?) details)))
+(defn- verify-db-connection
+  "Test connection to database with DETAILS and throw an exception if we have any troubles connecting."
+  [engine details]
+  {:pre [(keyword? engine) (map? details)]}
+  (log/info "Verifying Database Connection ...")
+  (assert (binding [*allow-potentailly-unsafe-connections* true]
+            (require 'metabase.driver)
+            (@(resolve 'metabase.driver/can-connect-with-details?) engine details))
+    "Unable to connect to Metabase DB.")
+  (log/info "Verify Database Connection ... CHECK"))
 
 (defn setup-db
   "Do general perparation of database by validating that we can connect.
    Caller can specify if we should run any pending database migrations."
-  [& {:keys [auto-migrate]
-      :or {auto-migrate true}}]
+  [& {:keys [db-details auto-migrate]
+      :or   {db-details   @db-connection-details
+             auto-migrate true}}]
   (reset! setup-db-has-been-called? true)
 
-  ;; Test DB connection and throw exception if we have any troubles connecting
-  (log/info "Verifying Database Connection ...")
-  (assert (db-can-connect? {:engine  (:type @db-connection-details)
-                            :details @db-connection-details})
-    "Unable to connect to Metabase DB.")
-  (log/info "Verify Database Connection ... CHECK")
+  (verify-db-connection (:type db-details) db-details)
 
   ;; Run through our DB migration process and make sure DB is fully prepared
   (if auto-migrate
-    (migrate :up)
+    (migrate db-details :up)
     ;; if we are not doing auto migrations then print out migration sql for user to run manually
     ;; then throw an exception to short circuit the setup process and make it clear we can't proceed
-    (let [sql (migrate :print)]
+    (let [sql (migrate db-details :print)]
       (log/info (str "Database Upgrade Required\n\n"
                      "NOTICE: Your database requires updates to work with this version of Metabase.  "
                      "Please execute the following sql commands on your database before proceeding.\n\n"
@@ -175,11 +178,12 @@
   (log/info "Database Migrations Current ... CHECK")
 
   ;; Establish our 'default' Korma DB Connection
-  (kdb/default-connection (kdb/create-db @jdbc-connection-details))
+  (kdb/default-connection (kdb/create-db (jdbc-details db-details)))
 
   ;; Do any custom code-based migrations now that the db structure is up to date
   ;; NOTE: we use dynamic resolution to prevent circular dependencies
-  ((u/runtime-resolved-fn 'metabase.db.migrations 'run-all)))
+  (require 'metabase.db.migrations)
+  (@(resolve 'metabase.db.migrations/run-all)))
 
 (defn setup-db-if-needed [& args]
   (when-not @setup-db-has-been-called?
@@ -199,15 +203,13 @@
    Returns true if update modified rows, false otherwise."
   [entity entity-id & {:as kwargs}]
   {:pre [(integer? entity-id)]}
-  (let [obj (->> (assoc kwargs :id entity-id)
-                 (models/pre-update entity)
-                 (models/internal-pre-update entity)
-                 (#(dissoc % :id)))
-        result (-> (k/update entity (k/set-fields obj) (k/where {:id entity-id}))
-                   (> 0))]
-    (when result
-      (models/post-update entity (assoc obj :id entity-id)))
-    result))
+  (let [obj           (models/do-pre-update entity (assoc kwargs :id entity-id))
+        rows-affected (k/update entity
+                                (k/set-fields (dissoc obj :id))
+                                (k/where {:id entity-id}))]
+    (when (> rows-affected 0)
+      (models/post-update obj))
+    (> rows-affected 0)))
 
 (defn upd-non-nil-keys
   "Calls `upd`, but filters out KWARGS with `nil` values."
@@ -316,14 +318,12 @@
 
    Returns newly created object by calling `sel`."
   [entity & {:as kwargs}]
-  (let [vals (->> kwargs
-                  (models/pre-insert entity)
-                  (models/internal-pre-insert entity))
-        {:keys [id]} (-> (k/insert entity (k/values vals))
-                         ;; this takes database specific keys returned from a jdbc insert and maps them to :id
-                         (set/rename-keys {(keyword "scope_identity()") :id
-                                           :generated_key               :id}))]
-    (models/post-insert entity (entity id))))
+  (let [vals         (models/do-pre-insert entity kwargs)
+        ;; take database-specific keys returned from a jdbc insert and map them to :id
+        {:keys [id]} (set/rename-keys (k/insert entity (k/values vals))
+                                      {(keyword "scope_identity()") :id
+                                       :generated_key               :id})]
+    (some-> id entity models/post-insert)))
 
 
 ;; ## EXISTS?
@@ -343,8 +343,8 @@
 (defn -cascade-delete [entity f]
   (let [entity  (i/entity->korma entity)
         results (i/sel-exec entity f)]
-    (dorun (for [obj results]
-             (do (models/pre-cascade-delete entity obj)
+    (dorun (for [obj (map (partial models/do-post-select entity) results)]
+             (do (models/pre-cascade-delete obj)
                  (del entity :id (:id obj))))))
   {:status 204, :body nil})
 

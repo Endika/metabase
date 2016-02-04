@@ -1,21 +1,26 @@
 (ns metabase.test-setup
   "Functions that run before + after unit tests (setup DB, start web server, load test data)."
-  (:require [clojure.java.io :as io]
+  (:require (clojure.java [classpath :as classpath]
+                          [io :as io])
             [clojure.set :as set]
             [clojure.tools.logging :as log]
+            [clojure.tools.namespace.find :as ns-find]
             [expectations :refer :all]
             (metabase [core :as core]
                       [db :as db]
+                      [driver :as driver]
                       [util :as u])
-            (metabase.models [table :refer [Table]])
-            [metabase.test.data.datasets :as datasets]))
+            (metabase.models [setting :as setting]
+                             [table :refer [Table]])
+            [metabase.test.data :as data]
+            [metabase.test.data.datasets :as datasets]
+            [metabase.util :as u]))
 
 ;; # ---------------------------------------- EXPECTAIONS FRAMEWORK SETTINGS ------------------------------
 
 ;; ## GENERAL SETTINGS
 
 ;; Don't run unit tests whenever JVM shuts down
-;; it's pretty annoying to have our DB reset all the time
 (expectations/disable-run-on-shutdown)
 
 
@@ -60,32 +65,30 @@
                       (< (count e) (count a))             "actual is larger than expected"
                       (> (count e) (count a))             "expected is larger than actual"))))
 
-
 ;; # ------------------------------ FUNCTIONS THAT GET RUN ON TEST SUITE START / STOP ------------------------------
 
-(defn load-test-datasets
-  "Call `load-data!` on all the datasets we're testing against."
-  []
-  (doseq [dataset-name datasets/test-dataset-names]
-    (log/info (format "Loading test data: %s..." (name dataset-name)))
-    (let [dataset (datasets/dataset-name->dataset dataset-name)]
-      (datasets/load-data! dataset)
-
-      ;; Check that dataset is loaded and working
-      (assert (Table (datasets/table-name->id dataset :venues))
-        (format "Loading test dataset %s failed: could not find 'venues' Table!" dataset-name)))))
+;; this is a little odd, but our normal `test-startup` function won't work for loading the drivers because
+;; they need to be available at evaluation time for some of the unit tests work work properly, so we put this here
+(driver/find-and-load-drivers!)
 
 (defn test-startup
   {:expectations-options :before-run}
   []
   ;; We can shave about a second from unit test launch time by doing the various setup stages in on different threads
-  (let [setup-db (future (time (do (log/info "Setting up test DB and running migrations...")
-                                   (db/setup-db :auto-migrate true)
-                                   (load-test-datasets)
-                                   (metabase.models.setting/set :site-name "Metabase Test")
-                                   (core/initialization-complete!))))]
-    (core/start-jetty)
-    @setup-db))
+  ;; Start Jetty in the BG so if test setup fails we have an easier time debugging it -- it's trickier to debug things on a BG thread
+  (let [start-jetty! (future (core/start-jetty))]
+
+    (try
+      (log/info "Setting up test DB and running migrations...")
+      (db/setup-db :auto-migrate true)
+      (setting/set :site-name "Metabase Test")
+      (core/initialization-complete!)
+      ;; If test setup fails exit right away
+      (catch Throwable e
+        (log/error (u/format-color 'red "Test setup failed: %s\n%s" e (u/pprint-to-str (.getStackTrace e))))
+        (System/exit -1)))
+
+    @start-jetty!))
 
 
 (defn test-teardown
@@ -93,3 +96,52 @@
   []
   (log/info "Shutting down Metabase unit test runner")
   (core/stop-jetty))
+
+
+
+;; Check that we're on target for every public var in Metabase having a docstring
+;; This will abort unit tests if we don't hit our target
+(defn- expected-docstr-percentage-for-day-of-year
+  "Calculate the percentage of public vars we expect to have a docstring by the current date in time. This ranges from 80% for the end of January to 100% half way through the year."
+  ([]
+   (expected-docstr-percentage-for-day-of-year (u/date-extract :day-of-year)))
+  ([doy]
+   (let [start-day                  30
+         start-percent              80.0
+         target-doy-for-100-percent 180
+         remaining-percent          (- 100.0 start-percent)
+         remaining-days             (- target-doy-for-100-percent start-day)]
+     (Math/min (+ start-percent (* (/ remaining-percent remaining-days)
+                                   (- doy start-day)))
+               100.0))))
+
+(defn- does-metabase-need-more-dox? []
+  (let [symb->has-doc?      (into {} (for [ns          (ns-find/find-namespaces (classpath/classpath))
+                                           :let        [nm (try (str (ns-name ns))
+                                                                (catch Throwable _))]
+                                           :when       nm
+                                           :when       (re-find #"^metabase" nm)
+                                           :when       (not (re-find #"test" nm))
+                                           [symb varr] (ns-publics ns)]
+                                       {(symbol (str nm "/" symb)) (boolean (:doc (meta varr)))}))
+        vs                  (vals symb->has-doc?)
+        total               (count vs)
+        num-with-dox        (count (filter identity vs))
+        percentage          (float (* (/ num-with-dox total)
+                                      100.0))
+        expected-percentage (expected-docstr-percentage-for-day-of-year)
+        needs-more-dox?     (< percentage expected-percentage)]
+    (println (u/format-color (if needs-more-dox? 'red 'green)
+                 "%.1f%% of Metabase public vars have docstrings. (%d/%d) Expected for today: %.1f%%" percentage num-with-dox total expected-percentage))
+    (println (u/format-color 'cyan "Why don't you go write a docstr for %s?" (first (shuffle (for [[symb has-doc?] symb->has-doc?
+                                                                                                   :when           (not has-doc?)]
+                                                                                               symb)))))
+    needs-more-dox?))
+
+
+(defn- throw-if-metabase-doesnt-have-enough-docstrings!
+  {:expectations-options :before-run}
+  []
+  (when (does-metabase-need-more-dox?)
+    (println (u/format-color 'red "Metabase needs more docstrings! Go write some more (or make some vars ^:private) before proceeding."))
+    (System/exit -1)))

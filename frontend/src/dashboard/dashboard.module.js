@@ -3,9 +3,7 @@ var Dashboard = angular.module('metabase.dashboard', [
     'ngRoute',
     'metabase.directives',
     'metabase.services',
-    'metabase.dashboard.services',
-    'metabase.dashboard.controllers',
-    'metabase.card.services'
+    'metabase.dashboard.controllers'
 ]);
 
 Dashboard.config(['$routeProvider', function ($routeProvider) {

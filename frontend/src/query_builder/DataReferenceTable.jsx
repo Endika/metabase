@@ -31,8 +31,12 @@ export default class DataReferenceTable extends Component {
     componentWillMount() {
         this.props.loadTableFn(this.props.table.id).then((result) => {
             this.setState({
-                table: result.metadata,
+                table: result.table,
                 tableForeignKeys: result.foreignKeys
+            });
+        }).catch((error) => {
+            this.setState({
+                error: "An error occurred loading the table"
             });
         });
     }
@@ -52,8 +56,8 @@ export default class DataReferenceTable extends Component {
         this.props.runQueryFn();
     }
 
-    render(page) {
-        var table = this.state.table;
+    render() {
+        const { table, error } = this.state;
         if (table) {
             var queryButton;
             if (table.rows != null) {
@@ -73,7 +77,7 @@ export default class DataReferenceTable extends Component {
                     'Button--active': name === this.state.pane
                 });
                 return (
-                    <a key={name} className={classes} href="#" onClick={this.showPane.bind(null, name)}>
+                    <a key={name} className={classes} onClick={this.showPane.bind(null, name)}>
                         <span className="DataReference-paneCount">{count}</span><span>{inflection.inflect(name, count)}</span>
                     </a>
                 );
@@ -84,7 +88,7 @@ export default class DataReferenceTable extends Component {
                 var fields = table.fields.map((field, index) => {
                     return (
                         <li key={field.id} className="p1 border-row-divider">
-                            <a className="text-brand text-brand-darken-hover no-decoration" href="#" onClick={this.props.showField.bind(null, field)}>{field.display_name}</a>
+                            <a className="text-brand text-brand-darken-hover no-decoration" onClick={this.props.showField.bind(null, field)}>{field.display_name}</a>
                         </li>
                     );
                 });
@@ -99,7 +103,7 @@ export default class DataReferenceTable extends Component {
 
                     return (
                         <li key={fk.id} className="p1 border-row-divider">
-                            <a className="text-brand text-brand-darken-hover no-decoration" href="#" onClick={this.props.showField.bind(null, fk.origin)}>{fk.origin.table.display_name}{via}</a>
+                            <a className="text-brand text-brand-darken-hover no-decoration" onClick={this.props.showField.bind(null, fk.origin)}>{fk.origin.table.display_name}{via}</a>
                         </li>
                     );
                 });
@@ -121,7 +125,9 @@ export default class DataReferenceTable extends Component {
                 </div>
             );
         } else {
-            return null;
+            return (
+                <div>{error}</div>
+            );
         }
     }
 }

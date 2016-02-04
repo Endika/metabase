@@ -16,8 +16,29 @@ This will launch a Heroku deployment using a github repository that Metabase mai
 
 ### Known Issues
 
- * Sometimes the app boots slowly on Heroku instances and fails to fully start within 60 seconds which results in a failed launch.  Just watch out for this and retry if it happens.
  * Heroku’s 30 second timeouts on all web requests can cause a few issues if you happen to have longer running database queries.  Most people don’t run into this but be aware that it’s possible.
- * If you don’t access the application for a while Heroku will sleep your Metabase environment.  This won’t harm anything, but it can seem like the application is slow to respond when actually it’s just Heroku waking up the environment.
+ * If you don’t access the application for a while Heroku will sleep your Metabase environment.  This prevents things like Pulses and Metabase background tasks from running when scheduled and at times makes the app appear to be slow when really it's just Heroku reloading your app.
 
 Now that you’ve installed Metabase, it’s time to [set it up and connect it to your database](../setting-up-metabase.md).
+
+
+# Deploying New Versions of Metabase
+
+Upgrading to the next version of Metabase is a simple process where you will grab the latest version of [metabase-deploy](https://github.com/metabase/metabase-deploy) and push it to Heroku.
+
+Here's each step:
+
+* Clone the latest version to your local machine:
+```
+git clone https://github.com/metabase/metabase-deploy.git
+cd metabase-deploy
+```
+* Add a git remote with your metabase setup:
+```
+git remote add heroku https://git.heroku.com/your-metabase-app.git
+```
+* Force push the new version to Heroku:
+```
+git push -f heroku master
+```
+* Wait for the deploy to finish

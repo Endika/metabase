@@ -1,34 +1,58 @@
 (ns metabase.driver.query-processor-test
-  "Query processing tests that can be ran between any of the available drivers, and should give the same results."
-  (:require [clojure.walk :as walk]
+  "Query processing tests that can be ran between any of the available non-event-based DB drivers, and should give the same results.
+   Event-based DBs such as Druid are tested in `metabase.driver.event-query-processor-test`."
+  (:require [clojure.math.numeric-tower :as math]
+            (clojure [set :as set]
+                     [string :as s])
             [expectations :refer :all]
+            [korma.core :as k]
             [metabase.db :refer :all]
             [metabase.driver :as driver]
             [metabase.driver.query-processor :refer :all]
+            [metabase.driver.query-processor.expand :as ql]
             (metabase.models [field :refer [Field]]
                              [table :refer [Table]])
-            [metabase.test.data :refer :all]
             (metabase.test.data [dataset-definitions :as defs]
-                                [datasets :as datasets :refer [*dataset*]]
-                                [interface :refer [create-database-definition]])
-            [metabase.test.util.q :refer [Q]]
-            [metabase.util :as u]))
+                                [datasets :as datasets :refer [*data-loader* *engine*]]
+                                [interface :refer [create-database-definition], :as i])
+            [metabase.test.data :refer :all]
+            [metabase.util :as u]
+            [metabase.util.quotation :as q]))
 
 
 ;; ## Dataset-Independent QP Tests
 
 ;; ### Helper Fns + Macros
 
-(defmacro ^:private qp-expect-with-all-datasets [data q-form & post-process-fns]
-  `(datasets/expect-with-all-datasets
-    {:status    :completed
-     :row_count ~(count (:rows data))
-     :data      ~data}
-    (-> ~q-form
-        ~@post-process-fns)))
+;; Event-Based DBs aren't tested here, but in `event-query-processor-test` instead.
+(def ^:private ^:const timeseries-engines #{:druid})
+(def ^:private ^:const non-timeseries-engines (set/difference datasets/all-valid-engines timeseries-engines))
 
-(defmacro ^:private qp-expect-with-datasets [datasets data q-form]
-  `(datasets/expect-with-datasets ~datasets
+(defn- engines-that-support [feature]
+  (set (filter (fn [engine]
+                 (contains? (driver/features (driver/engine->driver engine)) feature))
+               non-timeseries-engines)))
+
+(defn- engines-that-dont-support [feature]
+  (set/difference non-timeseries-engines (engines-that-support feature)))
+
+(defmacro ^:private expect-with-non-timeseries-dbs
+  {:style/indent 0}
+  [expected actual]
+  `(datasets/expect-with-engines non-timeseries-engines
+     ~expected
+     ~actual))
+
+(defmacro ^:private qp-expect-with-all-engines [data q-form & post-process-fns]
+  `(expect-with-non-timeseries-dbs
+     {:status    :completed
+      :row_count ~(count (:rows data))
+      :data      ~data}
+     (-> ~q-form
+         ~@post-process-fns)))
+
+(defmacro ^:private qp-expect-with-engines [datasets data q-form]
+  `(datasets/expect-with-engines ~datasets
      {:status    :completed
       :row_count ~(count (:rows data))
       :data      ~data}
@@ -46,50 +70,53 @@
 ;; These are meant for inclusion in the expected output of the QP tests, to save us from writing the same results several times
 
 ;; #### categories
+
+(defn- col-defaults []
+  {:extra_info      {}
+   :target          nil
+   :description     nil
+   :preview_display true
+   :schema_name     (default-schema)})
+
 (defn- categories-col
   "Return column information for the `categories` column named by keyword COL."
   [col]
-  (case col
-    :id   {:extra_info {} :target nil :special_type :id, :base_type (id-field-type), :description nil,
-           :name (format-name "id") :display_name "Id" :preview_display true :table_id (id :categories), :id (id :categories :id)}
-    :name {:extra_info {} :target nil :special_type :name, :base_type :TextField, :description nil,
-           :name (format-name "name") :display_name "Name" :preview_display true :table_id (id :categories), :id (id :categories :name)}))
+  (merge
+   (col-defaults)
+   {:table_id (id :categories)
+    :id       (id :categories col)}
+   (case col
+     :id   {:special_type :id
+            :base_type    (id-field-type)
+            :name         (format-name "id")
+            :display_name "Id"}
+     :name {:special_type :name
+            :base_type    (expected-base-type->actual :TextField)
+            :name         (format-name "name")
+            :display_name "Name"})))
 
 ;; #### users
 (defn- users-col
   "Return column information for the `users` column named by keyword COL."
   [col]
-  (case col
-    :id         {:extra_info   {}
-                 :target       nil
-                 :special_type :id
-                 :base_type    (id-field-type)
-                 :description  nil
-                 :name         (format-name "id")
-                 :display_name "Id"
-                 :preview_display true
-                 :table_id     (id :users)
-                 :id           (id :users :id)}
-    :name       {:extra_info   {}
-                 :target       nil
-                 :special_type :category
-                 :base_type    :TextField
-                 :description  nil
-                 :name         (format-name "name")
-                 :display_name "Name"
-                 :preview_display true
-                 :table_id     (id :users)
-                 :id           (id :users :name)}
-    :last_login {:extra_info   {}
-                 :target       nil
-                 :special_type :category
-                 :base_type    (timestamp-field-type)
-                 :description  nil
-                 :name         (format-name "last_login")
-                 :display_name "Last Login"
-                 :preview_display true
-                 :table_id     (id :users)
-                 :id           (id :users :last_login)}))
+  (merge
+   (col-defaults)
+   {:table_id (id :users)
+    :id       (id :users col)}
+   (case col
+     :id         {:special_type :id
+                  :base_type    (id-field-type)
+                  :name         (format-name "id")
+                  :display_name "Id"}
+     :name       {:special_type :name
+                  :base_type    (expected-base-type->actual :TextField)
+                  :name         (format-name "name")
+                  :display_name "Name"}
+     :last_login {:special_type nil
+                  :base_type    (expected-base-type->actual :DateTimeField)
+                  :name         (format-name "last_login")
+                  :display_name "Last Login"
+                  :unit         :day})))
 
 ;; #### venues
 (defn- venues-columns
@@ -100,71 +127,41 @@
 (defn- venues-col
   "Return column information for the `venues` column named by keyword COL."
   [col]
-  (case col
-    :id          {:extra_info   {}
-                  :target       nil
-                  :special_type :id
-                  :base_type    (id-field-type)
-                  :description  nil
-                  :name         (format-name "id")
-                  :display_name "Id"
-                  :preview_display true
-                  :table_id     (id :venues)
-                  :id           (id :venues :id)}
-    :category_id {:extra_info   (if (fks-supported?) {:target_table_id (id :categories)}
-                                    {})
-                  :target       (if (fks-supported?) (-> (categories-col :id)
-                                                         (dissoc :target :extra_info))
-                                    nil)
-                  :special_type (if (fks-supported?) :fk
-                                    :category)
-                  :base_type    :IntegerField
-                  :description  nil
-                  :name         (format-name "category_id")
-                  :display_name "Category Id"
-                  :preview_display true
-                  :table_id     (id :venues)
-                  :id           (id :venues :category_id)}
-    :price       {:extra_info   {}
-                  :target       nil
-                  :special_type :category
-                  :base_type    :IntegerField
-                  :description  nil
-                  :name         (format-name "price")
-                  :display_name "Price"
-                  :preview_display true
-                  :table_id     (id :venues)
-                  :id           (id :venues :price)}
-    :longitude   {:extra_info   {}
-                  :target       nil
-                  :special_type :longitude,
-                  :base_type    :FloatField,
-                  :description  nil
-                  :name         (format-name "longitude")
-                  :display_name "Longitude"
-                  :preview_display true
-                  :table_id     (id :venues)
-                  :id           (id :venues :longitude)}
-    :latitude    {:extra_info   {}
-                  :target       nil
-                  :special_type :latitude
-                  :base_type    :FloatField
-                  :description  nil
-                  :name         (format-name "latitude")
-                  :display_name "Latitude"
-                  :preview_display true
-                  :table_id     (id :venues)
-                  :id           (id :venues :latitude)}
-    :name        {:extra_info   {}
-                  :target       nil
-                  :special_type :name
-                  :base_type    :TextField
-                  :description  nil
-                  :name         (format-name "name")
-                  :display_name "Name"
-                  :preview_display true
-                  :table_id     (id :venues)
-                  :id           (id :venues :name)}))
+  (merge
+   (col-defaults)
+   {:table_id (id :venues)
+    :id       (id :venues col)}
+   (case col
+     :id          {:special_type :id
+                   :base_type    (id-field-type)
+                   :name         (format-name "id")
+                   :display_name "Id"}
+     :category_id {:extra_info   (if (fks-supported?) {:target_table_id (id :categories)}
+                                     {})
+                   :target       (if (fks-supported?) (-> (categories-col :id)
+                                                          (dissoc :target :extra_info :schema_name))
+                                     nil)
+                   :special_type (if (fks-supported?) :fk
+                                     :category)
+                   :base_type    (expected-base-type->actual :IntegerField)
+                   :name         (format-name "category_id")
+                   :display_name "Category Id"}
+     :price       {:special_type :category
+                   :base_type    (expected-base-type->actual :IntegerField)
+                   :name         (format-name "price")
+                   :display_name "Price"}
+     :longitude   {:special_type :longitude,
+                   :base_type    (expected-base-type->actual :FloatField)
+                   :name         (format-name "longitude")
+                   :display_name "Longitude"}
+     :latitude    {:special_type :latitude
+                   :base_type    (expected-base-type->actual :FloatField)
+                   :name         (format-name "latitude")
+                   :display_name "Latitude"}
+     :name        {:special_type :name
+                   :base_type    (expected-base-type->actual :TextField)
+                   :name         (format-name "name")
+                   :display_name "Name"})))
 
 (defn- venues-cols
   "`cols` information for all the columns in `venues`."
@@ -175,45 +172,35 @@
 (defn- checkins-col
   "Return column information for the `checkins` column named by keyword COL."
   [col]
-  (case col
-    :id       {:extra_info   {}
-               :target       nil
-               :special_type :id
-               :base_type    (id-field-type)
-               :description  nil
-               :name         (format-name "id")
-               :display_name "Id"
-               :preview_display true
-               :table_id     (id :checkins)
-               :id           (id :checkins :id)}
-    :venue_id {:extra_info   (if (fks-supported?) {:target_table_id (id :venues)}
-                               {})
-               :target       (if (fks-supported?) (-> (venues-col :id)
-                                                      (dissoc :target :extra_info))
-                                 nil)
-               :special_type (when (fks-supported?)
-                               :fk)
-               :base_type    :IntegerField
-               :description  nil
-               :name         (format-name "venue_id")
-               :display_name "Venue Id"
-               :preview_display true
-               :table_id     (id :checkins)
-               :id           (id :checkins :venue_id)}
-    :user_id  {:extra_info   (if (fks-supported?) {:target_table_id (id :users)}
-                                 {})
-               :target       (if (fks-supported?) (-> (users-col :id)
-                                                      (dissoc :target :extra_info))
-                                 nil)
-               :special_type (if (fks-supported?) :fk
-                                 :category)
-               :base_type    :IntegerField
-               :description  nil
-               :name         (format-name "user_id")
-               :display_name "User Id"
-               :preview_display true
-               :table_id     (id :checkins)
-               :id           (id :checkins :user_id)}))
+  (merge
+   (col-defaults)
+   {:table_id (id :checkins)
+    :id       (id :checkins col)}
+   (case col
+     :id       {:special_type :id
+                :base_type    (id-field-type)
+                :name         (format-name "id")
+                :display_name "Id"}
+     :venue_id {:extra_info   (if (fks-supported?) {:target_table_id (id :venues)}
+                                  {})
+                :target       (if (fks-supported?) (-> (venues-col :id)
+                                                       (dissoc :target :extra_info :schema_name))
+                                  nil)
+                :special_type (when (fks-supported?)
+                                :fk)
+                :base_type    (expected-base-type->actual :IntegerField)
+                :name         (format-name "venue_id")
+                :display_name "Venue Id"}
+     :user_id  {:extra_info   (if (fks-supported?) {:target_table_id (id :users)}
+                                  {})
+                :target       (if (fks-supported?) (-> (users-col :id)
+                                                       (dissoc :target :extra_info :schema_name))
+                                  nil)
+                :special_type (if (fks-supported?) :fk
+                                  :category)
+                :base_type    (expected-base-type->actual :IntegerField)
+                :name         (format-name "user_id")
+                :display_name "User Id"})))
 
 
 ;;; #### aggregate columns
@@ -236,8 +223,7 @@
               :extra_info   {}
               :target       nil}))
   ([ag-col-kw {:keys [base_type special_type]}]
-   {:pre [base_type
-          special_type]}
+   {:pre [base_type special_type]}
    {:base_type    base_type
     :special_type special_type
     :id           nil
@@ -254,185 +240,280 @@
                     :stddev "stddev"
                     :sum    "sum")}))
 
+(defn format-rows-by
+  "Format the values in result ROWS with the fns at the corresponding indecies in FORMAT-FNS.
+   ROWS can be a sequence or any of the common map formats we expect in QP tests.
+
+     (format-rows-by [int str double] [[1 1 1]]) -> [[1 \"1\" 1.0]]
+
+   By default, does't call fns on `nil` values; pass a truthy value as optional param FORMAT-NIL-VALUES? to override this behavior."
+  ([format-fns rows]
+   (format-rows-by format-fns (not :format-nil-values?) rows))
+  ([format-fns format-nil-values? rows]
+   (cond
+     (:data rows) (update-in rows [:data :rows] (partial format-rows-by format-fns))
+     (:rows rows) (update    rows :rows         (partial format-rows-by format-fns))
+     :else        (vec (for [row rows]
+                         (vec (for [[f v] (partition 2 (interleave format-fns row))]
+                                (when (or v format-nil-values?)
+                                  (f v)))))))))
+
+(def ^:private formatted-venues-rows (partial format-rows-by [int str int (partial u/round-to-decimals 4) (partial u/round-to-decimals 4) int]))
+
+
+(defn rows
+  "Return the result rows from query results, or throw an Exception if they're missing."
+  [results]
+  (vec (or (-> results :data :rows)
+           (println (u/pprint-to-str 'red results))
+           (throw (Exception. "Error!")))))
+
+(defn first-row
+  "Return the first row in the results of a query, or throw an Exception if they're missing."
+  [results]
+  (first (rows results)))
+
 
 ;; # THE TESTS THEMSELVES (!)
 
+;; structured-query?
+(expect false (structured-query? {}))
+(expect false (structured-query? {:type "native"}))
+(expect true  (structured-query? {:type "query"}))
+
+;; rows-query-without-limits?
+(expect false (rows-query-without-limits? {:query {:aggregation {:aggregation-type :count}}}))
+(expect true  (rows-query-without-limits? {:query {:aggregation {:aggregation-type :rows}}}))
+(expect false (rows-query-without-limits? {:query {:aggregation {:aggregation-type :count}
+                                                   :limit       10}}))
+(expect false (rows-query-without-limits? {:query {:aggregation {:aggregation-type :count}
+                                                   :page        1}}))
+
 ;; ### "COUNT" AGGREGATION
-(qp-expect-with-all-datasets
+
+(qp-expect-with-all-engines
     {:rows    [[100]]
      :columns ["count"]
      :cols    [(aggregate-col :count)]}
-  (Q aggregate count of venues))
+  (->> (run-query venues
+         (ql/aggregation (ql/count)))
+       (format-rows-by [int])))
 
 
 ;; ### "SUM" AGGREGATION
-(qp-expect-with-all-datasets
+(qp-expect-with-all-engines
     {:rows    [[203]]
      :columns ["sum"]
      :cols    [(aggregate-col :sum (venues-col :price))]}
-  (Q aggregate sum price of venues)
-  ;; for some annoying reason SUM(`venues`.`price`) in MySQL comes back from JDBC as a BigDecimal.
-  ;; Cast results as int regardless because ain't nobody got time for dat
-  (update-in [:data :rows] vec)
-  (update-in [:data :rows 0 0] int))
+  (->> (run-query venues
+         (ql/aggregation (ql/sum $price)))
+       (format-rows-by [int])))
 
 
 ;; ## "AVG" AGGREGATION
-(qp-expect-with-all-datasets
-    {:rows    [[35.50589199999998]]
+(qp-expect-with-all-engines
+    {:rows    [[35.5059]]
      :columns ["avg"]
      :cols    [(aggregate-col :avg (venues-col :latitude))]}
-  (Q aggregate avg latitude of venues))
+  (->> (run-query venues
+         (ql/aggregation (ql/avg $latitude)))
+       (format-rows-by [(partial u/round-to-decimals 4)])))
 
 
 ;; ### "DISTINCT COUNT" AGGREGATION
-(qp-expect-with-all-datasets
+(qp-expect-with-all-engines
     {:rows    [[15]]
      :columns ["count"]
      :cols    [(aggregate-col :count)]}
-  (Q aggregate distinct user_id of checkins))
+  (format-rows-by [int] (run-query checkins
+                          (ql/aggregation (ql/distinct $user_id)))))
 
 
 ;; ## "ROWS" AGGREGATION
 ;; Test that a rows aggregation just returns rows as-is.
-(qp-expect-with-all-datasets
-    {:rows    [[1 "Red Medicine" 4 10.0646 -165.374 3]
-               [2 "Stout Burgers & Beers" 11 34.0996 -118.329 2]
-               [3 "The Apple Pan" 11 34.0406 -118.428 2]
-               [4 "Wurstküche" 29 33.9997 -118.465 2]
-               [5 "Brite Spot Family Restaurant" 20 34.0778 -118.261 2]
-               [6 "The 101 Coffee Shop" 20 34.1054 -118.324 2]
-               [7 "Don Day Korean Restaurant" 44 34.0689 -118.305 2]
-               [8 "25°" 11 34.1015 -118.342 2]
-               [9 "Krua Siri" 71 34.1018 -118.301 1]
-               [10 "Fred 62" 20 34.1046 -118.292 2]]
+(qp-expect-with-all-engines
+    {:rows    [[ 1 "Red Medicine"                  4 10.0646 -165.374 3]
+               [ 2 "Stout Burgers & Beers"        11 34.0996 -118.329 2]
+               [ 3 "The Apple Pan"                11 34.0406 -118.428 2]
+               [ 4 "Wurstküche"                   29 33.9997 -118.465 2]
+               [ 5 "Brite Spot Family Restaurant" 20 34.0778 -118.261 2]
+               [ 6 "The 101 Coffee Shop"          20 34.1054 -118.324 2]
+               [ 7 "Don Day Korean Restaurant"    44 34.0689 -118.305 2]
+               [ 8 "25°"                          11 34.1015 -118.342 2]
+               [ 9 "Krua Siri"                    71 34.1018 -118.301 1]
+               [10 "Fred 62"                      20 34.1046 -118.292 2]]
      :columns (venues-columns)
      :cols    (venues-cols)}
-  (Q aggregate rows of venues
-     limit 10
-     order id+))
+  (formatted-venues-rows (run-query venues
+                           (ql/limit 10)
+                           (ql/order-by (ql/asc $id)))))
 
 
 ;; ## "PAGE" CLAUSE
 ;; Test that we can get "pages" of results.
 
 ;; ### PAGE - Get the first page
-(qp-expect-with-all-datasets
-    {:rows    [[1 "African"]
-               [2 "American"]
-               [3 "Artisan"]
-               [4 "Asian"]
-               [5 "BBQ"]]
-     :columns (->columns "id" "name")
-     :cols    [(categories-col :id)
-               (categories-col :name)]}
-  (Q aggregate rows of categories
-     page 1 items 5
-     order id+))
+(expect-with-non-timeseries-dbs
+  [[1 "African"]
+   [2 "American"]
+   [3 "Artisan"]
+   [4 "Asian"]
+   [5 "BBQ"]]
+  (->> (run-query categories
+         (ql/page {:page 1, :items 5})
+         (ql/order-by (ql/asc $id)))
+       rows (format-rows-by [int str])))
 
 ;; ### PAGE - Get the second page
-(qp-expect-with-all-datasets
-    {:rows    [[6 "Bakery"]
-               [7 "Bar"]
-               [8 "Beer Garden"]
-               [9 "Breakfast / Brunch"]
-               [10 "Brewery"]]
-     :columns (->columns "id" "name")
-     :cols    [(categories-col :id)
-               (categories-col :name)]}
-  (Q aggregate rows of categories
-     page 2 items 5
-     order id+))
+(expect-with-non-timeseries-dbs
+  [[ 6 "Bakery"]
+   [ 7 "Bar"]
+   [ 8 "Beer Garden"]
+   [ 9 "Breakfast / Brunch"]
+   [10 "Brewery"]]
+  (->> (run-query categories
+         (ql/page {:page 2, :items 5})
+         (ql/order-by (ql/asc $id)))
+       rows (format-rows-by [int str])))
 
 
 ;; ## "ORDER_BY" CLAUSE
 ;; Test that we can tell the Query Processor to return results ordered by multiple fields
-(qp-expect-with-all-datasets
-    {:rows    [[1 12 375] [1 9 139] [1 1 72] [2 15 129] [2 12 471] [2 11 325] [2 9 590] [2 9 833] [2 8 380] [2 5 719]],
-     :columns (->columns "venue_id" "user_id" "id")
-     :cols    [(checkins-col :venue_id)
-               (checkins-col :user_id)
-               (checkins-col :id)]}
-  (Q aggregate rows of checkins
-     fields venue_id user_id id
-     order venue_id+ user_id- id+
-     limit 10))
+(expect-with-non-timeseries-dbs
+  [[1 12 375]
+   [1  9 139]
+   [1  1  72]
+   [2 15 129]
+   [2 12 471]
+   [2 11 325]
+   [2  9 590]
+   [2  9 833]
+   [2  8 380]
+   [2  5 719]]
+  (->> (run-query checkins
+         (ql/fields $venue_id $user_id $id)
+         (ql/order-by (ql/asc $venue_id)
+                      (ql/desc $user_id)
+                      (ql/asc $id))
+         (ql/limit 10))
+       rows (format-rows-by [int int int])))
 
 
 ;; ## "FILTER" CLAUSE
 
 ;; ### FILTER -- "AND", ">", ">="
-(qp-expect-with-all-datasets
-    {:rows    [[55 "Dal Rae Restaurant" 67 33.983 -118.096 4]
-               [61 "Lawry's The Prime Rib" 67 34.0677 -118.376 4]
-               [77 "Sushi Nakazawa" 40 40.7318 -74.0045 4]
-               [79 "Sushi Yasuda" 40 40.7514 -73.9736 4]
-               [81 "Tanoshi Sushi & Sake Bar" 40 40.7677 -73.9533 4]]
-     :columns (venues-columns)
-     :cols    (venues-cols)}
-  (Q aggregate rows of venues
-     filter and > id 50, >= price 4))
+(expect-with-non-timeseries-dbs
+  [[55 "Dal Rae Restaurant"       67 33.983  -118.096 4]
+   [61 "Lawry's The Prime Rib"    67 34.0677 -118.376 4]
+   [77 "Sushi Nakazawa"           40 40.7318 -74.0045 4]
+   [79 "Sushi Yasuda"             40 40.7514 -73.9736 4]
+   [81 "Tanoshi Sushi & Sake Bar" 40 40.7677 -73.9533 4]]
+  (-> (run-query venues
+        (ql/filter (ql/and (ql/>  $id    50)
+                           (ql/>= $price  4)))
+        (ql/order-by (ql/asc $id)))
+      rows formatted-venues-rows))
 
 ;; ### FILTER -- "AND", "<", ">", "!="
-(qp-expect-with-all-datasets
-    {:rows    [[21 "PizzaHacker" 58 37.7441 -122.421 2]
-               [23 "Taqueria Los Coyotes" 50 37.765 -122.42 2]]
-     :columns (venues-columns)
-     :cols    (venues-cols)}
-  (Q aggregate rows of venues
-     filter and < id 24, > id 20, != id 22))
+(expect-with-non-timeseries-dbs
+  [[21 "PizzaHacker"          58 37.7441 -122.421 2]
+   [23 "Taqueria Los Coyotes" 50 37.765  -122.42  2]]
+  (-> (run-query venues
+        (ql/filter (ql/and (ql/<  $id 24)
+                           (ql/>  $id 20)
+                           (ql/!= $id 22)))
+        (ql/order-by (ql/asc $id)))
+      rows formatted-venues-rows))
 
 ;; ### FILTER WITH A FALSE VALUE
 ;; Check that we're checking for non-nil values, not just logically true ones.
 ;; There's only one place (out of 3) that I don't like
-(datasets/expect-with-all-datasets
- [1]
- (Q dataset places-cam-likes
-    return first-row
-    aggregate count of places
-    filter = liked false))
+(expect-with-non-timeseries-dbs
+  [[1]]
+  (->> (dataset places-cam-likes
+         (run-query places
+           (ql/aggregation (ql/count))
+           (ql/filter (ql/= $liked false))))
+       rows (format-rows-by [int])))
+
+(defn- ->bool [x] ; SQLite returns 0/1 for false/true;
+  (condp = x      ; Redshift returns nil/true.
+    0   false     ; convert to false/true and restore sanity.
+    1   true
+    nil false
+    x))
+
+;;; filter = true
+(expect-with-non-timeseries-dbs
+  [[1 "Tempest" true]
+   [2 "Bullit"  true]]
+  (->> (dataset places-cam-likes
+         (run-query places
+           (ql/filter (ql/= $liked true))
+           (ql/order-by (ql/asc $id))))
+       rows (format-rows-by [int str ->bool] :format-nil-values)))
+
+;;; filter != false
+(expect-with-non-timeseries-dbs
+  [[1 "Tempest" true]
+   [2 "Bullit"  true]]
+  (->> (dataset places-cam-likes
+         (run-query places
+           (ql/filter (ql/!= $liked false))
+           (ql/order-by (ql/asc $id))))
+       rows (format-rows-by [int str ->bool] :format-nil-values)))
+
+;;; filter != true
+(expect-with-non-timeseries-dbs
+  [[3 "The Dentist" false]]
+  (->> (dataset places-cam-likes
+         (run-query places
+           (ql/filter (ql/!= $liked true))
+           (ql/order-by (ql/asc $id))))
+       rows (format-rows-by [int str ->bool] :format-nil-values)))
+
 
 ;; ### FILTER -- "BETWEEN", single subclause (neither "AND" nor "OR")
-(qp-expect-with-all-datasets
-    {:rows    [[21 "PizzaHacker" 58 37.7441 -122.421 2]
-               [22 "Gordo Taqueria" 50 37.7822 -122.484 1]]
-     :columns (venues-columns)
-     :cols    (venues-cols)}
-  (Q aggregate rows of venues
-     filter between id 21 22))
+(expect-with-non-timeseries-dbs
+  [[21 "PizzaHacker"    58 37.7441 -122.421 2]
+   [22 "Gordo Taqueria" 50 37.7822 -122.484 1]]
+  (-> (run-query venues
+        (ql/filter (ql/between $id 21 22))
+        (ql/order-by (ql/asc $id)))
+      rows formatted-venues-rows))
 
 ;; ### FILTER -- "BETWEEN" with dates
-(qp-expect-with-all-datasets
+(qp-expect-with-all-engines
     {:rows    [[29]]
      :columns ["count"]
      :cols    [(aggregate-col :count)]}
-  (Q aggregate count of checkins
-     filter and between date "2015-04-01" "2015-05-01"))
+  (format-rows-by [int] (run-query checkins
+                          (ql/aggregation (ql/count))
+                          (ql/filter (ql/between $date "2015-04-01" "2015-05-01")))))
 
 ;; ### FILTER -- "OR", "<=", "="
-(qp-expect-with-all-datasets
-    {:rows    [[1 "Red Medicine" 4 10.0646 -165.374 3]
-               [2 "Stout Burgers & Beers" 11 34.0996 -118.329 2]
-               [3 "The Apple Pan" 11 34.0406 -118.428 2]
-               [5 "Brite Spot Family Restaurant" 20 34.0778 -118.261 2]]
-     :columns (venues-columns)
-     :cols    (venues-cols)}
-  (Q aggregate rows of venues
-     filter or <= id 3 = id 5))
+(expect-with-non-timeseries-dbs
+  [[1 "Red Medicine"                  4 10.0646 -165.374 3]
+   [2 "Stout Burgers & Beers"        11 34.0996 -118.329 2]
+   [3 "The Apple Pan"                11 34.0406 -118.428 2]
+   [5 "Brite Spot Family Restaurant" 20 34.0778 -118.261 2]]
+  (-> (run-query venues
+        (ql/filter (ql/or (ql/<= $id 3)
+                          (ql/= $id 5)))
+        (ql/order-by (ql/asc $id)))
+      rows formatted-venues-rows))
 
 ;; ### FILTER -- "INSIDE"
-(qp-expect-with-all-datasets
-    {:rows    [[1 "Red Medicine" 4 10.0646 -165.374 3]]
-     :columns (venues-columns)
-     :cols    (venues-cols)}
-  (Q aggregate rows of venues
-     filter inside {:lat {:field latitude, :min 10.0641, :max 10.0649}
-                    :lon {:field longitude, :min -165.379, :max -165.371}}))
+(expect-with-non-timeseries-dbs
+  [[1 "Red Medicine" 4 10.0646 -165.374 3]]
+  (-> (run-query venues
+        (ql/filter (ql/inside $latitude $longitude 10.0649 -165.379 10.0641 -165.371)))
+      rows formatted-venues-rows))
 
 
 ;; ## "FIELDS" CLAUSE
 ;; Test that we can restrict the Fields that get returned to the ones specified, and that results come back in the order of the IDs in the `fields` clause
-(qp-expect-with-all-datasets
+(qp-expect-with-all-engines
     {:rows    [["Red Medicine" 1]
                ["Stout Burgers & Beers" 2]
                ["The Apple Pan" 3]
@@ -446,41 +527,54 @@
      :columns (->columns "name" "id")
      :cols    [(venues-col :name)
                (venues-col :id)]}
-  (Q aggregate rows of venues
-     fields name id
-     limit 10
-     order id+))
+  (format-rows-by [str int] (run-query venues
+                              (ql/fields $name $id)
+                              (ql/limit 10)
+                              (ql/order-by (ql/asc $id)))))
 
 
 ;; ## "BREAKOUT"
 ;; ### "BREAKOUT" - SINGLE COLUMN
-(qp-expect-with-all-datasets
+(qp-expect-with-all-engines
     {:rows    [[1 31] [2 70] [3 75] [4 77] [5 69] [6 70] [7 76] [8 81] [9 68] [10 78] [11 74] [12 59] [13 76] [14 62] [15 34]],
      :columns [(format-name "user_id")
                "count"]
      :cols    [(checkins-col :user_id)
                (aggregate-col :count)]}
-  (Q aggregate count of checkins
-     breakout user_id
-     order user_id+))
+  (format-rows-by [int int] (run-query checkins
+                              (ql/aggregation (ql/count))
+                              (ql/breakout $user_id)
+                              (ql/order-by (ql/asc $user_id)))))
+
+;; ### BREAKOUT w/o AGGREGATION
+;; This should act as a "distinct values" query and return ordered results
+(qp-expect-with-all-engines
+    {:cols    [(checkins-col :user_id)]
+     :columns [(format-name "user_id")]
+     :rows    [[1] [2] [3] [4] [5] [6] [7] [8] [9] [10]]}
+  (format-rows-by [int] (run-query checkins
+                          (ql/breakout $user_id)
+                          (ql/limit 10))))
+
 
 ;; ### "BREAKOUT" - MULTIPLE COLUMNS W/ IMPLICT "ORDER_BY"
 ;; Fields should be implicitly ordered :ASC for all the fields in `breakout` that are not specified in `order_by`
-(qp-expect-with-all-datasets
-    {:rows    [[1 1 1] [1 5 1] [1 7 1] [1 10 1] [1 13 1] [1 16 1] [1 26 1] [1 31 1] [1 35 1] [1 36 1]],
+(qp-expect-with-all-engines
+    {:rows    [[1 1 1] [1 5 1] [1 7 1] [1 10 1] [1 13 1] [1 16 1] [1 26 1] [1 31 1] [1 35 1] [1 36 1]]
      :columns [(format-name "user_id")
                (format-name "venue_id")
                "count"]
      :cols    [(checkins-col :user_id)
                (checkins-col :venue_id)
                (aggregate-col :count)]}
-  (Q aggregate count of checkins
-     breakout user_id venue_id
-     limit 10))
+  (format-rows-by [int int int] (run-query checkins
+                                  (ql/aggregation (ql/count))
+                                  (ql/breakout $user_id $venue_id)
+                                  (ql/limit 10))))
 
 ;; ### "BREAKOUT" - MULTIPLE COLUMNS W/ EXPLICIT "ORDER_BY"
 ;; `breakout` should not implicitly order by any fields specified in `order_by`
-(qp-expect-with-all-datasets
+(qp-expect-with-all-engines
     {:rows    [[15 2 1] [15 3 1] [15 7 1] [15 14 1] [15 16 1] [15 18 1] [15 22 1] [15 23 2] [15 24 1] [15 27 1]],
      :columns [(format-name "user_id")
                (format-name "venue_id")
@@ -488,10 +582,11 @@
      :cols    [(checkins-col :user_id)
                (checkins-col :venue_id)
                (aggregate-col :count)]}
-  (Q aggregate count of checkins
-     breakout user_id venue_id
-     order user_id- venue_id+
-     limit 10))
+  (format-rows-by [int int int] (run-query checkins
+                                  (ql/aggregation (ql/count))
+                                  (ql/breakout $user_id $venue_id)
+                                  (ql/order-by (ql/desc $user_id))
+                                  (ql/limit 10))))
 
 
 
@@ -499,147 +594,165 @@
 ;; # POST PROCESSING TESTS
 
 ;; ## LIMIT-MAX-RESULT-ROWS
-;; Apply limit-max-result-rows to an infinite sequence and make sure it gets capped at `max-result-rows`
-(expect max-result-rows
-  (->> (((u/runtime-resolved-fn 'metabase.driver.query-processor 'limit) identity) {:rows (repeat [:ok])})
+;; Apply limit-max-result-rows to an infinite sequence and make sure it gets capped at `absolute-max-results`
+(expect absolute-max-results
+  (->> ((@(resolve 'metabase.driver.query-processor/limit) identity) {:rows (repeat [:ok])})
        :rows
        count))
+
+;; Apply an arbitrary max-results on the query and ensure our results size is appropriately constrained
+(expect 1234
+  (->> (((resolve 'metabase.driver.query-processor/limit) identity) {:constraints {:max-results 1234}
+                                                                     :query       {:aggregation {:aggregation-type :count}}
+                                                                     :rows        (repeat [:ok])})
+       :rows
+       count))
+
+;; Apply a max-results-bare-rows limit specifically on :rows type query
+(expect [46 46]
+  (let [res (((resolve 'metabase.driver.query-processor/limit) identity) {:constraints {:max-results 46}
+                                                                          :query       {:aggregation {:aggregation-type :rows}}
+                                                                          :rows        (repeat [:ok])})]
+    [(->> res :rows count)
+     (->> res :query :limit)]))
 
 
 ;; ## CUMULATIVE SUM
 
-(defn- ->sum-type
-  "Since summed integer fields come back as different types depending on which DB we're use, cast value V appropriately."
-  [v]
-  ((case (sum-field-type)
-      :IntegerField    int
-      :BigIntegerField bigdec) v))
-
 ;; ### cum_sum w/o breakout should be treated the same as sum
-(qp-expect-with-all-datasets
-    {:rows    [[(->sum-type 120)]]
+(qp-expect-with-all-engines
+    {:rows    [[120]]
      :columns ["sum"]
      :cols    [(aggregate-col :sum (users-col :id))]}
-  (Q aggregate cum-sum id of users))
+  (format-rows-by [int] (run-query users
+                          (ql/aggregation (ql/cum-sum $id)))))
 
 
 ;; ### Simple cumulative sum where breakout field is same as cum_sum field
-(qp-expect-with-all-datasets
+(qp-expect-with-all-engines
     {:rows    [[1] [3] [6] [10] [15] [21] [28] [36] [45] [55] [66] [78] [91] [105] [120]]
      :columns (->columns "id")
      :cols    [(users-col :id)]}
-  (Q aggregate cum-sum id of users
-     breakout id))
+  (format-rows-by [int] (run-query users
+                          (ql/aggregation (ql/cum-sum $id))
+                          (ql/breakout $id))))
 
 
 ;; ### Cumulative sum w/ a different breakout field
-(qp-expect-with-all-datasets
-    {:rows    [["Broen Olujimi"       (->sum-type 14)]
-               ["Conchúr Tihomir"     (->sum-type 21)]
-               ["Dwight Gresham"      (->sum-type 34)]
-               ["Felipinho Asklepios" (->sum-type 36)]
-               ["Frans Hevel"         (->sum-type 46)]
-               ["Kaneonuskatew Eiran" (->sum-type 49)]
-               ["Kfir Caj"            (->sum-type 61)]
-               ["Nils Gotam"          (->sum-type 70)]
-               ["Plato Yeshua"        (->sum-type 71)]
-               ["Quentin Sören"       (->sum-type 76)]
-               ["Rüstem Hebel"        (->sum-type 91)]
-               ["Shad Ferdynand"      (->sum-type 97)]
-               ["Simcha Yan"          (->sum-type 101)]
-               ["Spiros Teofil"       (->sum-type 112)]
-               ["Szymon Theutrich"    (->sum-type 120)]]
+(qp-expect-with-all-engines
+    {:rows    [["Broen Olujimi"        14]
+               ["Conchúr Tihomir"      21]
+               ["Dwight Gresham"       34]
+               ["Felipinho Asklepios"  36]
+               ["Frans Hevel"          46]
+               ["Kaneonuskatew Eiran"  49]
+               ["Kfir Caj"             61]
+               ["Nils Gotam"           70]
+               ["Plato Yeshua"         71]
+               ["Quentin Sören"        76]
+               ["Rüstem Hebel"         91]
+               ["Shad Ferdynand"       97]
+               ["Simcha Yan"          101]
+               ["Spiros Teofil"       112]
+               ["Szymon Theutrich"    120]]
      :columns [(format-name "name")
                "sum"]
      :cols    [(users-col :name)
                (aggregate-col :sum (users-col :id))]}
-  (Q aggregate cum-sum id of users
-     breakout name))
+  (format-rows-by [str int] (run-query users
+                              (ql/aggregation (ql/cum-sum $id))
+                              (ql/breakout $name))))
 
 
 ;; ### Cumulative sum w/ a different breakout field that requires grouping
-(qp-expect-with-all-datasets
+(qp-expect-with-all-engines
     {:columns [(format-name "price")
                "sum"]
      :cols    [(venues-col :price)
                (aggregate-col :sum (venues-col :id))]
-     :rows    [[1 (->sum-type 1211)]
-               [2 (->sum-type 4066)]
-               [3 (->sum-type 4681)]
-               [4 (->sum-type 5050)]]}
-  (Q aggregate cum-sum id of venues
-     breakout price))
+     :rows    [[1 1211]
+               [2 4066]
+               [3 4681]
+               [4 5050]]}
+  (format-rows-by [int int] (run-query venues
+                              (ql/aggregation (ql/cum-sum $id))
+                              (ql/breakout $price))))
 
 
 ;;; ## STDDEV AGGREGATION
 ;;; SQL-Only for the time being
 
 ;; ## "STDDEV" AGGREGATION
-(qp-expect-with-datasets #{:h2 :postgres :mysql}
+(qp-expect-with-engines (engines-that-support :standard-deviation-aggregations)
   {:columns ["stddev"]
    :cols    [(aggregate-col :stddev (venues-col :latitude))]
-   :rows    [[(datasets/dataset-case
-                :h2       3.43467255295115      ; annoying :/
-                :postgres 3.4346725529512736
-                :mysql    3.417456040761316)]]}
-  (Q aggregate stddev latitude of venues))
+   :rows    [[3.4]]}
+  (-> (run-query venues
+        (ql/aggregation (ql/stddev $latitude)))
+      (update-in [:data :rows] (fn [[[v]]]
+                                 [[(u/round-to-decimals 1 v)]]))))
 
 ;; Make sure standard deviation fails for the Mongo driver since its not supported
-(datasets/expect-with-dataset :mongo
+(datasets/expect-with-engines (engines-that-dont-support :standard-deviation-aggregations)
   {:status :failed
    :error  "standard-deviation-aggregations is not supported by this driver."}
-  (select-keys (Q aggregate stddev latitude of venues) [:status :error]))
+  (select-keys (run-query venues
+                 (ql/aggregation (ql/stddev $latitude)))
+               [:status :error]))
 
 
 ;;; ## order_by aggregate fields (SQL-only for the time being)
 
 ;;; ### order_by aggregate ["count"]
-(qp-expect-with-datasets #{:h2 :postgres :mysql}
+(qp-expect-with-all-engines
   {:columns [(format-name "price")
              "count"]
-   :rows    [[4 6]
+   :rows    [[4  6]
              [3 13]
              [1 22]
              [2 59]]
    :cols    [(venues-col :price)
              (aggregate-col :count)]}
-  (Q aggregate count of venues
-     breakout price
-     order ag.0+))
+  (format-rows-by [int int] (run-query venues
+                              (ql/aggregation (ql/count))
+                              (ql/breakout $price)
+                              (ql/order-by (ql/asc (ql/aggregate-field 0))))))
 
 
 ;;; ### order_by aggregate ["sum" field-id]
-(qp-expect-with-datasets #{:h2 :postgres :mysql}
+(qp-expect-with-all-engines
   {:columns [(format-name "price")
              "sum"]
-   :rows    [[2 (->sum-type 2855)]
-             [1 (->sum-type 1211)]
-             [3 (->sum-type 615)]
-             [4 (->sum-type 369)]]
+   :rows    [[2 2855]
+             [1 1211]
+             [3  615]
+             [4  369]]
    :cols    [(venues-col :price)
              (aggregate-col :sum (venues-col :id))]}
-  (Q aggregate sum id of venues
-     breakout price
-     order ag.0-))
+  (format-rows-by [int int] (run-query venues
+                              (ql/aggregation (ql/sum $id))
+                              (ql/breakout $price)
+                              (ql/order-by (ql/desc (ql/aggregate-field 0))))))
 
 
 ;;; ### order_by aggregate ["distinct" field-id]
-(qp-expect-with-datasets #{:h2 :postgres :mysql}
+(qp-expect-with-all-engines
   {:columns [(format-name "price")
              "count"]
-   :rows    [[4 6]
+   :rows    [[4  6]
              [3 13]
              [1 22]
              [2 59]]
    :cols    [(venues-col :price)
              (aggregate-col :count)]}
-  (Q aggregate distinct id of venues
-     breakout price
-     order ag.0+))
+  (format-rows-by [int int] (run-query venues
+                              (ql/aggregation (ql/distinct $id))
+                              (ql/breakout $price)
+                              (ql/order-by (ql/asc (ql/aggregate-field 0))))))
 
 
 ;;; ### order_by aggregate ["avg" field-id]
-(datasets/expect-with-dataset :h2
+(expect-with-non-timeseries-dbs
   {:columns [(format-name "price")
              "avg"]
    :rows    [[3 22]
@@ -648,98 +761,68 @@
              [4 53]]
    :cols    [(venues-col :price)
              (aggregate-col :avg (venues-col :category_id))]}
-  (Q return :data
-     of venues
-     aggregate avg category_id
-     breakout price
-     order ag.0+))
-
-;; Values are slightly different for Postgres
-(datasets/expect-with-dataset :postgres
-  {:rows [[3 22.0000000000000000M]
-          [2 28.2881355932203390M]
-          [1 32.8181818181818182M]
-          [4 53.5000000000000000M]]
-   :columns [(format-name "price")
-             "avg"]
-   :cols [(venues-col :price)
-          (aggregate-col :avg (venues-col :category_id))]}
-  (Q return :data
-     of venues
-     aggregate avg category_id
-     breakout price
-     order ag.0+))
+  (->> (run-query venues
+         (ql/aggregation (ql/avg $category_id))
+         (ql/breakout $price)
+         (ql/order-by (ql/asc (ql/aggregate-field 0))))
+       :data (format-rows-by [int int])))
 
 ;;; ### order_by aggregate ["stddev" field-id]
-(datasets/expect-with-dataset :h2
+;; MySQL has a nasty tendency to return different results on different systems so just round everything to the nearest int.
+;; It also seems to give slightly different results than less-sucky DBs as evidenced below
+(datasets/expect-with-engines (engines-that-support :standard-deviation-aggregations)
   {:columns [(format-name "price")
              "stddev"]
-   :rows    [[3 26.19160170741759]
-             [1 24.112111881665186]
-             [2 21.418692164795292]
-             [4 14.788509052639485]]
+   :rows    [[3 (if (= *engine* :mysql) 25 26)]
+             [1 24]
+             [2 21]
+             [4 (if (= *engine* :mysql) 14 15)]]
    :cols    [(venues-col :price)
              (aggregate-col :stddev (venues-col :category_id))]}
-  (Q return :data
-     of venues
-     aggregate stddev category_id
-     breakout price
-     order ag.0-))
-
-(datasets/expect-with-dataset :postgres
-  {:columns [(format-name "price")
-             "stddev"]
-   :rows    [[3 26.1916017074175897M]
-             [1 24.1121118816651851M]
-             [2 21.4186921647952867M]
-             [4 14.7885090526394851M]]
-   :cols    [(venues-col :price)
-             (aggregate-col :stddev (venues-col :category_id))]}
-  (Q return :data
-     of venues
-     aggregate stddev category_id
-     breakout price
-     order ag.0-))
-
+  (->> (run-query venues
+         (ql/aggregation (ql/stddev $category_id))
+         (ql/breakout $price)
+         (ql/order-by (ql/desc (ql/aggregate-field 0))))
+       :data (format-rows-by [int (comp int math/round)])))
 
 ;;; ### make sure that rows where preview_display = false are included and properly marked up
-(datasets/expect-with-all-datasets
- [(set (venues-cols))
-  #{(venues-col :category_id)
-    (venues-col :name)
-    (venues-col :latitude)
-    (venues-col :id)
-    (venues-col :longitude)
-    (-> (venues-col :price)
-        (assoc :preview_display false))}
-  (set (venues-cols))]
- (let [get-col-names (fn [] (Q aggregate rows of venues
-                               order id+
-                               limit 1
-                               return :data :cols set))]
-   [(get-col-names)
-    (do (upd Field (id :venues :price) :preview_display false)
-        (get-col-names))
-    (do (upd Field (id :venues :price) :preview_display true)
-        (get-col-names))]))
+(expect-with-non-timeseries-dbs
+  [(set (venues-cols))
+   #{(venues-col :category_id)
+     (venues-col :name)
+     (venues-col :latitude)
+     (venues-col :id)
+     (venues-col :longitude)
+     (-> (venues-col :price)
+         (assoc :preview_display false))}
+   (set (venues-cols))]
+  (let [get-col-names (fn [] (-> (run-query venues
+                                   (ql/order-by (ql/asc $id))
+                                   (ql/limit 1))
+                                 :data :cols set))]
+    [(get-col-names)
+     (do (upd Field (id :venues :price) :preview_display false)
+         (get-col-names))
+     (do (upd Field (id :venues :price) :preview_display true)
+         (get-col-names))]))
 
 
 ;;; ## :sensitive fields
 ;;; Make sure :sensitive information fields are never returned by the QP
-(qp-expect-with-all-datasets
-    {:columns (->columns "id" "last_login" "name")
+(qp-expect-with-all-engines
+    {:columns (->columns "id" "name" "last_login")
      :cols    [(users-col :id)
-               (users-col :last_login)
-               (users-col :name)],
-     :rows    [[1 "Plato Yeshua"]
-               [2 "Felipinho Asklepios"]
-               [3 "Kaneonuskatew Eiran"]
-               [4 "Simcha Yan"]
-               [5 "Quentin Sören"]
-               [6 "Shad Ferdynand"]
-               [7 "Conchúr Tihomir"]
-               [8 "Szymon Theutrich"]
-               [9 "Nils Gotam"]
+               (users-col :name)
+               (users-col :last_login)],
+     :rows    [[ 1 "Plato Yeshua"]
+               [ 2 "Felipinho Asklepios"]
+               [ 3 "Kaneonuskatew Eiran"]
+               [ 4 "Simcha Yan"]
+               [ 5 "Quentin Sören"]
+               [ 6 "Shad Ferdynand"]
+               [ 7 "Conchúr Tihomir"]
+               [ 8 "Szymon Theutrich"]
+               [ 9 "Nils Gotam"]
                [10 "Frans Hevel"]
                [11 "Spiros Teofil"]
                [12 "Kfir Caj"]
@@ -747,9 +830,10 @@
                [14 "Broen Olujimi"]
                [15 "Rüstem Hebel"]]}
   ;; Filter out the timestamps from the results since they're hard to test :/
-  (-> (Q aggregate rows of users
-         order id+)
-      (update-in [:data :rows] (partial mapv (partial filterv #(not (isa? (type %) java.util.Date)))))))
+  (-> (run-query users
+        (ql/order-by (ql/asc $id)))
+      (update-in [:data :rows] (partial mapv (fn [[id name last-login]]
+                                               [(int id) name])))))
 
 
 ;; +------------------------------------------------------------------------------------------------------------------------+
@@ -757,35 +841,61 @@
 ;; +------------------------------------------------------------------------------------------------------------------------+
 
 ;; There were 9 "sad toucan incidents" on 2015-06-02
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  9
-  (Q dataset sad-toucan-incidents
-     of incidents
-     filter and > timestamp "2015-06-01"
-                < timestamp "2015-06-03"
-     order timestamp+
-     return rows count))
+(expect-with-non-timeseries-dbs
+  (if (i/has-questionable-timezone-support? *data-loader*)
+    10
+    9)
+  (count (rows (dataset sad-toucan-incidents
+                 (run-query incidents
+                   (ql/filter (ql/and (ql/> $timestamp "2015-06-01")
+                                      (ql/< $timestamp "2015-06-03")))
+                   (ql/order-by (ql/asc $timestamp)))))))
 
+(expect-with-non-timeseries-dbs
+  (cond
+    (= *engine* :sqlite)
+    [["2015-06-01"  6]
+     ["2015-06-02" 10]
+     ["2015-06-03"  4]
+     ["2015-06-04"  9]
+     ["2015-06-05"  9]
+     ["2015-06-06"  8]
+     ["2015-06-07"  8]
+     ["2015-06-08"  9]
+     ["2015-06-09"  7]
+     ["2015-06-10"  9]]
 
-;;; Unix timestamp breakouts -- SQL only
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [["2015-06-01" 8]
-   ["2015-06-02" 9]
-   ["2015-06-03" 9]
-   ["2015-06-04" 4]
-   ["2015-06-05" 11]
-   ["2015-06-06" 8]
-   ["2015-06-07" 6]
-   ["2015-06-08" 10]
-   ["2015-06-09" 6]
-   ["2015-06-10" 10]]
-  (->> (Q dataset sad-toucan-incidents
-          aggregate count of incidents
-          breakout timestamp
-          limit 10
-          return rows)
-       (map (fn [[^java.util.Date date count]]
-              [(.toString date) (int count)]))))
+    ;; SQL Server, Mongo, and Redshift don't have a concept of timezone so results are all grouped by UTC
+    (i/has-questionable-timezone-support? *data-loader*)
+    [[#inst "2015-06-01T07"  6]
+     [#inst "2015-06-02T07" 10]
+     [#inst "2015-06-03T07"  4]
+     [#inst "2015-06-04T07"  9]
+     [#inst "2015-06-05T07"  9]
+     [#inst "2015-06-06T07"  8]
+     [#inst "2015-06-07T07"  8]
+     [#inst "2015-06-08T07"  9]
+     [#inst "2015-06-09T07"  7]
+     [#inst "2015-06-10T07"  9]]
+
+    ;; Postgres, MySQL, and H2 -- grouped by DB timezone, US/Pacific in this case
+    :else
+    [[#inst "2015-06-01T07"  8]
+     [#inst "2015-06-02T07"  9]
+     [#inst "2015-06-03T07"  9]
+     [#inst "2015-06-04T07"  4]
+     [#inst "2015-06-05T07" 11]
+     [#inst "2015-06-06T07"  8]
+     [#inst "2015-06-07T07"  6]
+     [#inst "2015-06-08T07" 10]
+     [#inst "2015-06-09T07"  6]
+     [#inst "2015-06-10T07" 10]])
+  (->> (dataset sad-toucan-incidents
+         (run-query incidents
+           (ql/aggregation (ql/count))
+           (ql/breakout $timestamp)
+           (ql/limit 10)))
+       rows (format-rows-by [identity int])))
 
 
 ;; +------------------------------------------------------------------------------------------------------------------------+
@@ -794,41 +904,42 @@
 
 ;; The top 10 cities by number of Tupac sightings
 ;; Test that we can breakout on an FK field (Note how the FK Field is returned in the results)
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [["Arlington" 16]
-   ["Albany" 15]
-   ["Portland" 14]
-   ["Louisville" 13]
+(datasets/expect-with-engines (engines-that-support :foreign-keys)
+  [["Arlington"    16]
+   ["Albany"       15]
+   ["Portland"     14]
+   ["Louisville"   13]
    ["Philadelphia" 13]
-   ["Anchorage" 12]
-   ["Lincoln" 12]
-   ["Houston" 11]
-   ["Irvine" 11]
-   ["Lakeland" 11]]
-  (Q dataset tupac-sightings
-     return rows
-     of sightings
-     aggregate count
-     breakout city_id->cities.name
-     order ag.0-
-     limit 10))
+   ["Anchorage"    12]
+   ["Lincoln"      12]
+   ["Houston"      11]
+   ["Irvine"       11]
+   ["Lakeland"     11]]
+  (->> (dataset tupac-sightings
+         (run-query sightings
+           (ql/aggregation (ql/count))
+           (ql/breakout $city_id->cities.name)
+           (ql/order-by (ql/desc (ql/aggregate-field 0)))
+           (ql/limit 10)))
+       rows (format-rows-by [str int])))
 
 
 ;; Number of Tupac sightings in the Expa office
 ;; (he was spotted here 60 times)
 ;; Test that we can filter on an FK field
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  60
-  (Q dataset tupac-sightings
-     return first-row first
-     aggregate count of sightings
-     filter = category_id->categories.id 8))
+(datasets/expect-with-engines (engines-that-support :foreign-keys)
+  [[60]]
+  (->> (dataset tupac-sightings
+         (run-query sightings
+           (ql/aggregation (ql/count))
+           (ql/filter (ql/= $category_id->categories.id 8))))
+       rows (format-rows-by [int])))
 
 
 ;; THE 10 MOST RECENT TUPAC SIGHTINGS (!)
 ;; (What he was doing when we saw him, sighting ID)
 ;; Check that we can include an FK field in the :fields clause
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
+(datasets/expect-with-engines (engines-that-support :foreign-keys)
   [[772 "In the Park"]
    [894 "Working at a Pet Store"]
    [684 "At the Airport"]
@@ -839,46 +950,50 @@
    [996 "At a Restaurant"]
    [897 "Wearing a Biggie Shirt"]
    [499 "In the Expa Office"]]
-  (Q dataset tupac-sightings
-     return rows
-     of sightings
-     fields id category_id->categories.name
-     order timestamp-
-     limit 10))
+  (->> (dataset tupac-sightings
+         (run-query sightings
+           (ql/fields $id $category_id->categories.name)
+           (ql/order-by (ql/desc $timestamp))
+           (ql/limit 10)))
+       rows (format-rows-by [int str])))
 
 
 ;; 1. Check that we can order by Foreign Keys
 ;;    (this query targets sightings and orders by cities.name and categories.name)
 ;; 2. Check that we can join MULTIPLE tables in a single query
 ;;    (this query joins both cities and categories)
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
+(datasets/expect-with-engines (engines-that-support :foreign-keys)
   ;; CITY_ID, CATEGORY_ID, ID
   ;; Cities are already alphabetized in the source data which is why CITY_ID is sorted
-  [[1 12 6]
+  [[1 12   6]
    [1 11 355]
    [1 11 596]
    [1 13 379]
-   [1 5 413]
-   [1 1 426]
-   [2 11 67]
+   [1  5 413]
+   [1  1 426]
+   [2 11  67]
    [2 11 524]
-   [2 13 77]
+   [2 13  77]
    [2 13 202]]
-  (Q dataset tupac-sightings
-     return rows (map butlast) (map reverse) ; drop timestamps. reverse ordering to make the results columns order match order_by
-     of sightings
-     order city_id->cities.name+ category_id->categories.name- id+
-     limit 10))
+  (->> (dataset tupac-sightings
+         (run-query sightings
+           (ql/order-by (ql/asc $city_id->cities.name)
+                        (ql/desc $category_id->categories.name)
+                        (ql/asc $id))
+           (ql/limit 10)))
+       rows (map butlast) (map reverse) (format-rows-by [int int int]))) ; drop timestamps. reverse ordering to make the results columns order match order_by
 
 
 ;; Check that trying to use a Foreign Key fails for Mongo
-(datasets/expect-with-dataset :mongo
+(datasets/expect-with-engines (engines-that-dont-support :foreign-keys)
   {:status :failed
    :error "foreign-keys is not supported by this driver."}
-  (select-keys (Q dataset tupac-sightings
-                  of sightings
-                  order city_id->cities.name+ category_id->categories.name- id+
-                  limit 10)
+  (select-keys (dataset tupac-sightings
+                 (run-query sightings
+                   (ql/order-by (ql/asc $city_id->cities.name)
+                                (ql/desc $category_id->categories.name)
+                                (ql/asc $id))
+                   (ql/limit 10)))
                [:status :error]))
 
 
@@ -888,26 +1003,26 @@
 
 ;;; Nested Field in FILTER
 ;; Get the first 10 tips where tip.venue.name == "Kyle's Low-Carb Grill"
-(datasets/expect-when-testing-dataset :mongo
-    [[8   "Kyle's Low-Carb Grill"]
-     [67  "Kyle's Low-Carb Grill"]
-     [80  "Kyle's Low-Carb Grill"]
-     [83  "Kyle's Low-Carb Grill"]
-     [295 "Kyle's Low-Carb Grill"]
-     [342 "Kyle's Low-Carb Grill"]
-     [417 "Kyle's Low-Carb Grill"]
-     [426 "Kyle's Low-Carb Grill"]
-     [470 "Kyle's Low-Carb Grill"]]
-  (Q dataset geographical-tips use mongo
-     return rows (map (fn [[id _ _ _ {venue-name :name}]] [id venue-name]))
-     aggregate rows of tips
-     filter = venue...name "Kyle's Low-Carb Grill"
-     order id
-     limit 10))
+(datasets/expect-with-engines (engines-that-support :nested-fields)
+  [[8   "Kyle's Low-Carb Grill"]
+   [67  "Kyle's Low-Carb Grill"]
+   [80  "Kyle's Low-Carb Grill"]
+   [83  "Kyle's Low-Carb Grill"]
+   [295 "Kyle's Low-Carb Grill"]
+   [342 "Kyle's Low-Carb Grill"]
+   [417 "Kyle's Low-Carb Grill"]
+   [426 "Kyle's Low-Carb Grill"]
+   [470 "Kyle's Low-Carb Grill"]]
+  (->> (dataset geographical-tips
+         (run-query tips
+           (ql/filter (ql/= $tips.venue.name "Kyle's Low-Carb Grill"))
+           (ql/order-by (ql/asc $id))
+           (ql/limit 10)))
+       rows (mapv (fn [[id _ _ _ {venue-name :name}]] [id venue-name]))))
 
 ;;; Nested Field in ORDER
 ;; Let's get all the tips Kyle posted on Twitter sorted by tip.venue.name
-(datasets/expect-when-testing-dataset :mongo
+(datasets/expect-with-engines (engines-that-support :nested-fields)
   [[446
     {:mentions ["@cams_mexican_gastro_pub"], :tags ["#mexican" "#gastro" "#pub"], :service "twitter", :username "kyle"}
     "Cam's Mexican Gastro Pub is a historical and underappreciated place to conduct a business meeting with friends."
@@ -936,145 +1051,149 @@
      :medium "http://cloudfront.net/cedd4221-dbdb-46c3-95a9-935cce6b3fe5/med.jpg",
      :small  "http://cloudfront.net/cedd4221-dbdb-46c3-95a9-935cce6b3fe5/small.jpg"}
     {:phone "415-901-6541", :name "Pacific Heights Free-Range Eatery", :categories ["Free-Range" "Eatery"], :id "88b361c8-ce69-4b2e-b0f2-9deedd574af6"}]]
-  (Q dataset geographical-tips use mongo
-     return rows
-     aggregate rows of tips
-     filter and = source...service "twitter"
-                = source...username "kyle"
-     order venue...name))
+  (rows (dataset geographical-tips
+          (run-query tips
+            (ql/filter (ql/and (ql/= $tips.source.service "twitter")
+                               (ql/= $tips.source.username "kyle")))
+            (ql/order-by (ql/asc $tips.venue.name))))))
 
 ;; Nested Field in AGGREGATION
 ;; Let's see how many *distinct* venue names are mentioned
-(datasets/expect-when-testing-dataset :mongo
-  99
-  (Q dataset geographical-tips use mongo
-     return first-row first
-     aggregate distinct venue...name of tips))
+(datasets/expect-with-engines (engines-that-support :nested-fields)
+  [99]
+  (first-row (dataset geographical-tips
+               (run-query tips
+                 (ql/aggregation (ql/distinct $tips.venue.name))))))
 
 ;; Now let's just get the regular count
-(datasets/expect-when-testing-dataset :mongo
-  500
-  (Q dataset geographical-tips use mongo
-     return first-row first
-     aggregate count venue...name of tips))
+(datasets/expect-with-engines (engines-that-support :nested-fields)
+  [500]
+  (first-row (dataset geographical-tips
+               (run-query tips
+                 (ql/aggregation (ql/count $tips.venue.name))))))
 
 ;;; Nested Field in BREAKOUT
 ;; Let's see how many tips we have by source.service
-(datasets/expect-when-testing-dataset :mongo
-  {:rows    [["facebook" 107]
-             ["flare" 105]
+(datasets/expect-with-engines (engines-that-support :nested-fields)
+  {:rows    [["facebook"   107]
+             ["flare"      105]
              ["foursquare" 100]
-             ["twitter" 98]
-             ["yelp" 90]]
+             ["twitter"     98]
+             ["yelp"        90]]
    :columns ["source.service" "count"]}
-  (Q dataset geographical-tips use mongo
-     return :data (#(dissoc % :cols))
-     aggregate count of tips
-     breakout source...service))
+  (->> (dataset geographical-tips
+         (run-query tips
+           (ql/aggregation (ql/count))
+           (ql/breakout $tips.source.service)))
+       :data (#(dissoc % :cols)) (format-rows-by [str int])))
 
 ;;; Nested Field in FIELDS
 ;; Return the first 10 tips with just tip.venue.name
-(datasets/expect-when-testing-dataset :mongo
-    [[{:name "Lucky's Gluten-Free Café"} 1]
-     [{:name "Joe's Homestyle Eatery"} 2]
-     [{:name "Lower Pac Heights Cage-Free Coffee House"} 3]
-     [{:name "Oakland European Liquor Store"} 4]
-     [{:name "Tenderloin Gormet Restaurant"} 5]
-     [{:name "Marina Modern Sushi"} 6]
-     [{:name "Sunset Homestyle Grill"} 7]
-     [{:name "Kyle's Low-Carb Grill"} 8]
-     [{:name "Mission Homestyle Churros"} 9]
-     [{:name "Sameer's Pizza Liquor Store"} 10]]
-  (Q dataset geographical-tips use mongo
-     return rows
-     aggregate rows of tips
-     order id
-     fields venue...name
-     limit 10))
+(datasets/expect-with-engines (engines-that-support :nested-fields)
+  {:columns ["venue.name"]
+   :rows    [["Lucky's Gluten-Free Café"]
+             ["Joe's Homestyle Eatery"]
+             ["Lower Pac Heights Cage-Free Coffee House"]
+             ["Oakland European Liquor Store"]
+             ["Tenderloin Gormet Restaurant"]
+             ["Marina Modern Sushi"]
+             ["Sunset Homestyle Grill"]
+             ["Kyle's Low-Carb Grill"]
+             ["Mission Homestyle Churros"]
+             ["Sameer's Pizza Liquor Store"]]}
+  (select-keys (:data (dataset geographical-tips
+                        (run-query tips
+                          (ql/fields $tips.venue.name)
+                          (ql/order-by (ql/asc $id))
+                          (ql/limit 10))))
+               [:columns :rows]))
 
 
 ;;; Nested Field w/ ordering by aggregation
-(datasets/expect-when-testing-dataset :mongo
-    [["jane" 4]
-     ["kyle" 5]
-     ["tupac" 5]
-     ["jessica" 6]
-     ["bob" 7]
-     ["lucky_pigeon" 7]
-     ["joe" 8]
-     ["mandy" 8]
-     ["amy" 9]
-     ["biggie" 9]
-     ["sameer" 9]
-     ["cam_saul" 10]
-     ["rasta_toucan" 13]
-     [nil 400]]
-  (Q dataset geographical-tips use mongo
-     return rows
-     aggregate count of tips
-     breakout source...mayor
-     order ag.0))
+(datasets/expect-with-engines (engines-that-support :nested-fields)
+  [["jane"           4]
+   ["kyle"           5]
+   ["tupac"          5]
+   ["jessica"        6]
+   ["bob"            7]
+   ["lucky_pigeon"   7]
+   ["joe"            8]
+   ["mandy"          8]
+   ["amy"            9]
+   ["biggie"         9]
+   ["sameer"         9]
+   ["cam_saul"      10]
+   ["rasta_toucan"  13]
+   [nil            400]]
+  (->> (dataset geographical-tips
+         (run-query tips
+           (ql/aggregation (ql/count))
+           (ql/breakout $tips.source.mayor)
+           (ql/order-by (ql/asc (ql/aggregate-field 0)))))
+       rows (format-rows-by [identity int])))
 
 
 ;;; # New Filter Types - CONTAINS, STARTS_WITH, ENDS_WITH
 
 ;;; ## STARTS_WITH
-(datasets/expect-with-all-datasets
- [[41 "Cheese Steak Shop" 18 37.7855 -122.44 1]
-  [74 "Chez Jay" 2 34.0104 -118.493 2]]
- (Q return rows
-    aggregate rows of venues
-    filter starts-with name "Che"
-    order id))
+(expect-with-non-timeseries-dbs
+  [[41 "Cheese Steak Shop" 18 37.7855 -122.44  1]
+   [74 "Chez Jay"           2 34.0104 -118.493 2]]
+  (-> (run-query venues
+        (ql/filter (ql/starts-with $name "Che"))
+        (ql/order-by (ql/asc $id)))
+      rows formatted-venues-rows))
 
 
 ;;; ## ENDS_WITH
-(datasets/expect-with-all-datasets
- [[5 "Brite Spot Family Restaurant" 20 34.0778 -118.261 2]
-  [7 "Don Day Korean Restaurant" 44 34.0689 -118.305 2]
-  [17 "Ruen Pair Thai Restaurant" 71 34.1021 -118.306 2]
-  [45 "Tu Lan Restaurant" 4 37.7821 -122.41 1]
-  [55 "Dal Rae Restaurant" 67 33.983 -118.096 4]]
- (Q return rows
-    aggregate rows of venues
-    filter ends-with name "Restaurant"
-    order id))
-
+(expect-with-non-timeseries-dbs
+  [[ 5 "Brite Spot Family Restaurant" 20 34.0778 -118.261 2]
+   [ 7 "Don Day Korean Restaurant"    44 34.0689 -118.305 2]
+   [17 "Ruen Pair Thai Restaurant"    71 34.1021 -118.306 2]
+   [45 "Tu Lan Restaurant"             4 37.7821 -122.41  1]
+   [55 "Dal Rae Restaurant"           67 33.983  -118.096 4]]
+  (-> (run-query venues
+        (ql/filter (ql/ends-with $name "Restaurant"))
+        (ql/order-by (ql/asc $id)))
+      rows formatted-venues-rows))
 
 ;;; ## CONTAINS
-(datasets/expect-with-all-datasets
- [[31 "Bludso's BBQ" 5 33.8894 -118.207 2]
-  [34 "Beachwood BBQ & Brewing" 10 33.7701 -118.191 2]
-  [39 "Baby Blues BBQ" 5 34.0003 -118.465 2]]
- (Q return rows
-    aggregate rows of venues
-    filter contains name "BBQ"
-    order id))
+(expect-with-non-timeseries-dbs
+  [[31 "Bludso's BBQ"             5 33.8894 -118.207 2]
+   [34 "Beachwood BBQ & Brewing" 10 33.7701 -118.191 2]
+   [39 "Baby Blues BBQ"           5 34.0003 -118.465 2]]
+  (-> (run-query venues
+        (ql/filter (ql/contains $name "BBQ"))
+        (ql/order-by (ql/asc $id)))
+      rows formatted-venues-rows))
 
 ;;; ## Nested AND / OR
 
-(datasets/expect-with-all-datasets
- [81]
- (Q aggregate count of venues
-    filter and != price 3
-               or = price 1
-               or = price 2
-    return first-row))
+(expect-with-non-timeseries-dbs
+  [[81]]
+  (->> (run-query venues
+         (ql/aggregation (ql/count))
+         (ql/filter (ql/and (ql/!= $price 3)
+                            (ql/or (ql/= $price 1)
+                                   (ql/= $price 2)))))
+       rows (format-rows-by [int])))
 
 
 ;;; ## = / != with multiple values
 
-(datasets/expect-with-all-datasets
- [81]
- (Q return first-row
-    aggregate count of venues
-    filter = price 1 2))
+(expect-with-non-timeseries-dbs
+  [[81]]
+  (->> (run-query venues
+         (ql/aggregation (ql/count))
+         (ql/filter (ql/= $price 1 2)))
+       rows (format-rows-by [int])))
 
-(datasets/expect-with-all-datasets
- [19]
- (Q return first-row
-    aggregate count of venues
-    filter != price 1 2))
+(expect-with-non-timeseries-dbs
+  [[19]]
+  (->> (run-query venues
+         (ql/aggregation (ql/count))
+         (ql/filter (ql/!= $price 1 2)))
+       rows (format-rows-by [int])))
 
 
 ;; +-------------------------------------------------------------------------------------------------------------+
@@ -1085,39 +1204,93 @@
 ;; ## BUCKETING
 
 (defn- sad-toucan-incidents-with-bucketing [unit]
-  (vec (Q dataset sad-toucan-incidents
-          aggregate count of incidents
-          breakout ["datetime_field" (id :incidents :timestamp) "as" unit]
-          limit 10
-          return rows)))
+  (->> (with-db (get-or-create-database! defs/sad-toucan-incidents)
+         (run-query incidents
+           (ql/aggregation (ql/count))
+           (ql/breakout (ql/datetime-field $timestamp unit))
+           (ql/limit 10)))
+       rows (format-rows-by [(fn [x] (if (number? x) (int x) x))
+                             int])))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [[#inst "2015-06-01T10:31" 1]
-   [#inst "2015-06-01T16:06" 1]
-   [#inst "2015-06-01T17:23" 1]
-   [#inst "2015-06-01T18:55" 1]
-   [#inst "2015-06-01T21:04" 1]
-   [#inst "2015-06-01T21:19" 1]
-   [#inst "2015-06-02T02:13" 1]
-   [#inst "2015-06-02T05:37" 1]
-   [#inst "2015-06-02T08:20" 1]
-   [#inst "2015-06-02T11:11" 1]]
+(expect-with-non-timeseries-dbs
+  (cond
+    (contains? #{:redshift :sqlserver} *engine*)
+    [[#inst "2015-06-01T17:31" 1]
+     [#inst "2015-06-01T23:06" 1]
+     [#inst "2015-06-02T00:23" 1]
+     [#inst "2015-06-02T01:55" 1]
+     [#inst "2015-06-02T04:04" 1]
+     [#inst "2015-06-02T04:19" 1]
+     [#inst "2015-06-02T09:13" 1]
+     [#inst "2015-06-02T12:37" 1]
+     [#inst "2015-06-02T15:20" 1]
+     [#inst "2015-06-02T18:11" 1]]
+
+    (= *engine* :sqlite)
+    [["2015-06-01 10:31:00" 1]
+     ["2015-06-01 16:06:00" 1]
+     ["2015-06-01 17:23:00" 1]
+     ["2015-06-01 18:55:00" 1]
+     ["2015-06-01 21:04:00" 1]
+     ["2015-06-01 21:19:00" 1]
+     ["2015-06-02 02:13:00" 1]
+     ["2015-06-02 05:37:00" 1]
+     ["2015-06-02 08:20:00" 1]
+     ["2015-06-02 11:11:00" 1]]
+
+    :else
+    [[#inst "2015-06-01T10:31" 1]
+     [#inst "2015-06-01T16:06" 1]
+     [#inst "2015-06-01T17:23" 1]
+     [#inst "2015-06-01T18:55" 1]
+     [#inst "2015-06-01T21:04" 1]
+     [#inst "2015-06-01T21:19" 1]
+     [#inst "2015-06-02T02:13" 1]
+     [#inst "2015-06-02T05:37" 1]
+     [#inst "2015-06-02T08:20" 1]
+     [#inst "2015-06-02T11:11" 1]])
   (sad-toucan-incidents-with-bucketing :default))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [[#inst "2015-06-01T10:31" 1]
-   [#inst "2015-06-01T16:06" 1]
-   [#inst "2015-06-01T17:23" 1]
-   [#inst "2015-06-01T18:55" 1]
-   [#inst "2015-06-01T21:04" 1]
-   [#inst "2015-06-01T21:19" 1]
-   [#inst "2015-06-02T02:13" 1]
-   [#inst "2015-06-02T05:37" 1]
-   [#inst "2015-06-02T08:20" 1]
-   [#inst "2015-06-02T11:11" 1]]
+(expect-with-non-timeseries-dbs
+  (cond
+    (= *engine* :sqlite)
+    [["2015-06-01 10:31:00" 1]
+     ["2015-06-01 16:06:00" 1]
+     ["2015-06-01 17:23:00" 1]
+     ["2015-06-01 18:55:00" 1]
+     ["2015-06-01 21:04:00" 1]
+     ["2015-06-01 21:19:00" 1]
+     ["2015-06-02 02:13:00" 1]
+     ["2015-06-02 05:37:00" 1]
+     ["2015-06-02 08:20:00" 1]
+     ["2015-06-02 11:11:00" 1]]
+
+    (i/has-questionable-timezone-support? *data-loader*)
+    [[#inst "2015-06-01T17:31" 1]
+     [#inst "2015-06-01T23:06" 1]
+     [#inst "2015-06-02T00:23" 1]
+     [#inst "2015-06-02T01:55" 1]
+     [#inst "2015-06-02T04:04" 1]
+     [#inst "2015-06-02T04:19" 1]
+     [#inst "2015-06-02T09:13" 1]
+     [#inst "2015-06-02T12:37" 1]
+     [#inst "2015-06-02T15:20" 1]
+     [#inst "2015-06-02T18:11" 1]]
+
+    :else
+    [[#inst "2015-06-01T10:31" 1]
+     [#inst "2015-06-01T16:06" 1]
+     [#inst "2015-06-01T17:23" 1]
+     [#inst "2015-06-01T18:55" 1]
+     [#inst "2015-06-01T21:04" 1]
+     [#inst "2015-06-01T21:19" 1]
+     [#inst "2015-06-02T02:13" 1]
+     [#inst "2015-06-02T05:37" 1]
+     [#inst "2015-06-02T08:20" 1]
+     [#inst "2015-06-02T11:11" 1]])
   (sad-toucan-incidents-with-bucketing :minute))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
+(expect-with-non-timeseries-dbs
   [[0 5]
    [1 4]
    [2 2]
@@ -1130,169 +1303,347 @@
    [9 1]]
   (sad-toucan-incidents-with-bucketing :minute-of-hour))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [[#inst "2015-06-01T10" 1]
-   [#inst "2015-06-01T16" 1]
-   [#inst "2015-06-01T17" 1]
-   [#inst "2015-06-01T18" 1]
-   [#inst "2015-06-01T21" 2]
-   [#inst "2015-06-02T02" 1]
-   [#inst "2015-06-02T05" 1]
-   [#inst "2015-06-02T08" 1]
-   [#inst "2015-06-02T11" 1]
-   [#inst "2015-06-02T13" 1]]
+(expect-with-non-timeseries-dbs
+  (cond
+    (= *engine* :sqlite)
+    [["2015-06-01 10:00:00" 1]
+     ["2015-06-01 16:00:00" 1]
+     ["2015-06-01 17:00:00" 1]
+     ["2015-06-01 18:00:00" 1]
+     ["2015-06-01 21:00:00" 2]
+     ["2015-06-02 02:00:00" 1]
+     ["2015-06-02 05:00:00" 1]
+     ["2015-06-02 08:00:00" 1]
+     ["2015-06-02 11:00:00" 1]
+     ["2015-06-02 13:00:00" 1]]
+
+    (i/has-questionable-timezone-support? *data-loader*)
+    [[#inst "2015-06-01T17" 1]
+     [#inst "2015-06-01T23" 1]
+     [#inst "2015-06-02T00" 1]
+     [#inst "2015-06-02T01" 1]
+     [#inst "2015-06-02T04" 2]
+     [#inst "2015-06-02T09" 1]
+     [#inst "2015-06-02T12" 1]
+     [#inst "2015-06-02T15" 1]
+     [#inst "2015-06-02T18" 1]
+     [#inst "2015-06-02T20" 1]]
+
+    :else
+    [[#inst "2015-06-01T10" 1]
+     [#inst "2015-06-01T16" 1]
+     [#inst "2015-06-01T17" 1]
+     [#inst "2015-06-01T18" 1]
+     [#inst "2015-06-01T21" 2]
+     [#inst "2015-06-02T02" 1]
+     [#inst "2015-06-02T05" 1]
+     [#inst "2015-06-02T08" 1]
+     [#inst "2015-06-02T11" 1]
+     [#inst "2015-06-02T13" 1]])
   (sad-toucan-incidents-with-bucketing :hour))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [[0 8]
-   [1 9]
-   [2 7]
-   [3 10]
-   [4 10]
-   [5 9]
-   [6 6]
-   [7 5]
-   [8 7]
-   [9 7]]
+(expect-with-non-timeseries-dbs
+  (if (i/has-questionable-timezone-support? *data-loader*)
+    [[0 13] [1 8] [2 4] [3  7] [4  5] [5 13] [6 10] [7 8] [8 9] [9 7]]
+    [[0  8] [1 9] [2 7] [3 10] [4 10] [5  9] [6  6] [7 5] [8 7] [9 7]])
   (sad-toucan-incidents-with-bucketing :hour-of-day))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [[#inst "2015-06-01T07" 8]
-   [#inst "2015-06-02T07" 9]
-   [#inst "2015-06-03T07" 9]
-   [#inst "2015-06-04T07" 4]
-   [#inst "2015-06-05T07" 11]
-   [#inst "2015-06-06T07" 8]
-   [#inst "2015-06-07T07" 6]
-   [#inst "2015-06-08T07" 10]
-   [#inst "2015-06-09T07" 6]
-   [#inst "2015-06-10T07" 10]]
+(expect-with-non-timeseries-dbs
+  (cond
+    (= *engine* :sqlite)
+    [["2015-06-01"  6]
+     ["2015-06-02" 10]
+     ["2015-06-03"  4]
+     ["2015-06-04"  9]
+     ["2015-06-05"  9]
+     ["2015-06-06"  8]
+     ["2015-06-07"  8]
+     ["2015-06-08"  9]
+     ["2015-06-09"  7]
+     ["2015-06-10"  9]]
+
+    (i/has-questionable-timezone-support? *data-loader*)
+    [[#inst "2015-06-01T07"  6]
+     [#inst "2015-06-02T07" 10]
+     [#inst "2015-06-03T07"  4]
+     [#inst "2015-06-04T07"  9]
+     [#inst "2015-06-05T07"  9]
+     [#inst "2015-06-06T07"  8]
+     [#inst "2015-06-07T07"  8]
+     [#inst "2015-06-08T07"  9]
+     [#inst "2015-06-09T07"  7]
+     [#inst "2015-06-10T07"  9]]
+
+    :else
+    [[#inst "2015-06-01T07"  8]
+     [#inst "2015-06-02T07"  9]
+     [#inst "2015-06-03T07"  9]
+     [#inst "2015-06-04T07"  4]
+     [#inst "2015-06-05T07" 11]
+     [#inst "2015-06-06T07"  8]
+     [#inst "2015-06-07T07"  6]
+     [#inst "2015-06-08T07" 10]
+     [#inst "2015-06-09T07"  6]
+     [#inst "2015-06-10T07" 10]])
   (sad-toucan-incidents-with-bucketing :day))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [[1 29]
-   [2 36]
-   [3 33]
-   [4 29]
-   [5 13]
-   [6 38]
-   [7 22]]
+(expect-with-non-timeseries-dbs
+  (if (i/has-questionable-timezone-support? *data-loader*)
+    [[1 28] [2 38] [3 29] [4 27] [5 24] [6 30] [7 24]]
+    [[1 29] [2 36] [3 33] [4 29] [5 13] [6 38] [7 22]])
   (sad-toucan-incidents-with-bucketing :day-of-week))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [[1 8]
-   [2 9]
-   [3 9]
-   [4 4]
-   [5 11]
-   [6 8]
-   [7 6]
-   [8 10]
-   [9 6]
-   [10 10]]
+(expect-with-non-timeseries-dbs
+  (if (i/has-questionable-timezone-support? *data-loader*)
+    [[1  6] [2 10] [3  4] [4  9] [5  9] [6  8] [7  8] [8  9] [9  7] [10  9]]
+    [[1  8] [2  9] [3  9] [4  4] [5 11] [6  8] [7  6] [8 10] [9  6] [10 10]])
   (sad-toucan-incidents-with-bucketing :day-of-month))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [[152 8]
-   [153 9]
-   [154 9]
-   [155 4]
-   [156 11]
-   [157 8]
-   [158 6]
-   [159 10]
-   [160 6]
-   [161 10]]
+(expect-with-non-timeseries-dbs
+  (if (i/has-questionable-timezone-support? *data-loader*)
+    [[152  6] [153 10] [154  4] [155  9] [156  9] [157  8] [158  8] [159  9] [160  7] [161  9]]
+    [[152  8] [153  9] [154  9] [155  4] [156 11] [157  8] [158  6] [159 10] [160  6] [161 10]])
   (sad-toucan-incidents-with-bucketing :day-of-year))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [[#inst "2015-05-31T07" 49]
-   [#inst "2015-06-07T07" 47]
-   [#inst "2015-06-14T07" 39]
-   [#inst "2015-06-21T07" 58]
-   [#inst "2015-06-28T07" 7]]
+(expect-with-non-timeseries-dbs
+  (cond
+    (= *engine* :sqlite)
+    [["2015-05-31" 46]
+     ["2015-06-07" 47]
+     ["2015-06-14" 40]
+     ["2015-06-21" 60]
+     ["2015-06-28" 7]]
+
+    (i/has-questionable-timezone-support? *data-loader*)
+    [[#inst "2015-05-31T07" 46]
+     [#inst "2015-06-07T07" 47]
+     [#inst "2015-06-14T07" 40]
+     [#inst "2015-06-21T07" 60]
+     [#inst "2015-06-28T07" 7]]
+
+    :else
+    [[#inst "2015-05-31T07" 49]
+     [#inst "2015-06-07T07" 47]
+     [#inst "2015-06-14T07" 39]
+     [#inst "2015-06-21T07" 58]
+     [#inst "2015-06-28T07" 7]])
   (sad-toucan-incidents-with-bucketing :week))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [[23 49]
-   [24 47]
-   [25 39]
-   [26 58]
-   [27 7]]
+(expect-with-non-timeseries-dbs
+  (cond
+    (contains? #{:sqlserver :sqlite} *engine*)
+    [[23 54] [24 46] [25 39] [26 61]]
+
+    (contains? #{:mongo :redshift} *engine*)
+    [[23 46] [24 47] [25 40] [26 60] [27 7]]
+
+    :else
+    [[23 49] [24 47] [25 39] [26 58] [27 7]])
   (sad-toucan-incidents-with-bucketing :week-of-year))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [[#inst "2015-06-01T07" 200]]
+(expect-with-non-timeseries-dbs
+  [[(if (= *engine* :sqlite) "2015-06-01", #inst "2015-06-01T07") 200]]
   (sad-toucan-incidents-with-bucketing :month))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
+(expect-with-non-timeseries-dbs
   [[6 200]]
   (sad-toucan-incidents-with-bucketing :month-of-year))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
-  [[#inst "2015-04-01T07" 200]]
+(expect-with-non-timeseries-dbs
+  [[(if (= *engine* :sqlite) "2015-04-01", #inst "2015-04-01T07") 200]]
   (sad-toucan-incidents-with-bucketing :quarter))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
+(expect-with-non-timeseries-dbs
   [[2 200]]
   (sad-toucan-incidents-with-bucketing :quarter-of-year))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
+(expect-with-non-timeseries-dbs
   [[2015 200]]
   (sad-toucan-incidents-with-bucketing :year))
 
 ;; RELATIVE DATES
 (defn- database-def-with-timestamps [interval-seconds]
-  (create-database-definition "DB"
+  (create-database-definition (str "a-checkin-every-" interval-seconds "-seconds")
     ["checkins"
      [{:field-name "timestamp"
        :base-type  :DateTimeField}]
      (vec (for [i (range -15 15)]
-            [(java.sql.Timestamp. (+ (System/currentTimeMillis) (* i 1000 interval-seconds)))]))]))
+            ;; Create timestamps using relative dates (e.g. `DATEADD(second, -195, GETUTCDATE())` instead of generating `java.sql.Timestamps` here so
+            ;; they'll be in the DB's native timezone. Some DBs refuse to use the same timezone we're running the tests from *cough* SQL Server *cough*
+            [(driver/date-interval *data-loader* :second (* i interval-seconds))]))]))
 
-(def ^:private checkins:4-per-minute (database-def-with-timestamps 15))
-(def ^:private checkins:4-per-hour   (database-def-with-timestamps (* 60 15)))
-(def ^:private checkins:1-per-day    (database-def-with-timestamps (* 60 60 24)))
+(def ^:private checkins:4-per-minute (partial database-def-with-timestamps 15))
+(def ^:private checkins:4-per-hour   (partial database-def-with-timestamps (* 60 15)))
+(def ^:private checkins:1-per-day    (partial database-def-with-timestamps (* 60 60 24)))
 
 (defn- count-of-grouping [db field-grouping & relative-datetime-args]
-  (with-temp-db [_ db]
-    (Q aggregate count of checkins
-       filter = ["datetime_field" (id :checkins :timestamp) "as" (name field-grouping)] (apply vector "relative_datetime" relative-datetime-args)
-       return first-row first)))
+  (-> (with-temp-db [_ db]
+        (run-query checkins
+          (ql/aggregation (ql/count))
+          (ql/filter (ql/= (ql/datetime-field $timestamp field-grouping)
+                           (apply ql/relative-datetime relative-datetime-args)))))
+      first-row first int))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql} 4 (count-of-grouping checkins:4-per-minute :minute "current"))
-(datasets/expect-with-datasets #{:h2 :postgres :mysql} 4 (count-of-grouping checkins:4-per-minute :minute -1 "minute"))
-(datasets/expect-with-datasets #{:h2 :postgres :mysql} 4 (count-of-grouping checkins:4-per-minute :minute  1 "minute"))
+(expect-with-non-timeseries-dbs 4 (count-of-grouping (checkins:4-per-minute) :minute "current"))
+(expect-with-non-timeseries-dbs 4 (count-of-grouping (checkins:4-per-minute) :minute -1 "minute"))
+(expect-with-non-timeseries-dbs 4 (count-of-grouping (checkins:4-per-minute) :minute  1 "minute"))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql} 4 (count-of-grouping checkins:4-per-hour :hour "current"))
-(datasets/expect-with-datasets #{:h2 :postgres :mysql} 4 (count-of-grouping checkins:4-per-hour :hour -1 "hour"))
-(datasets/expect-with-datasets #{:h2 :postgres :mysql} 4 (count-of-grouping checkins:4-per-hour :hour  1 "hour"))
+(expect-with-non-timeseries-dbs 4 (count-of-grouping (checkins:4-per-hour) :hour "current"))
+(expect-with-non-timeseries-dbs 4 (count-of-grouping (checkins:4-per-hour) :hour -1 "hour"))
+(expect-with-non-timeseries-dbs 4 (count-of-grouping (checkins:4-per-hour) :hour  1 "hour"))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql} 1 (count-of-grouping checkins:1-per-day :day "current"))
-(datasets/expect-with-datasets #{:h2 :postgres :mysql} 1 (count-of-grouping checkins:1-per-day :day -1 "day"))
-(datasets/expect-with-datasets #{:h2 :postgres :mysql} 1 (count-of-grouping checkins:1-per-day :day  1 "day"))
+(expect-with-non-timeseries-dbs 1 (count-of-grouping (checkins:1-per-day) :day "current"))
+(expect-with-non-timeseries-dbs 1 (count-of-grouping (checkins:1-per-day) :day -1 "day"))
+(expect-with-non-timeseries-dbs 1 (count-of-grouping (checkins:1-per-day) :day  1 "day"))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql} 7 (count-of-grouping checkins:1-per-day :week "current"))
+(expect-with-non-timeseries-dbs 7 (count-of-grouping (checkins:1-per-day) :week "current"))
 
 ;; SYNTACTIC SUGAR
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
+(expect-with-non-timeseries-dbs
   1
-  (with-temp-db [_ checkins:1-per-day]
-    (-> (driver/process-query
-         {:database (db-id)
-          :type     :query
-          :query    {:source_table (id :checkins)
-                     :aggregation  ["count"]
-                     :filter       ["TIME_INTERVAL" (id :checkins :timestamp) "current" "day"]}})
-        :data :rows first first)))
+  (-> (with-temp-db [_ (checkins:1-per-day)]
+        (run-query checkins
+          (ql/aggregation (ql/count))
+          (ql/filter (ql/time-interval $timestamp :current :day))))
+      first-row first int))
 
-(datasets/expect-with-datasets #{:h2 :postgres :mysql}
+(expect-with-non-timeseries-dbs
   7
-  (with-temp-db [_ checkins:1-per-day]
-    (-> (driver/process-query
-         {:database (db-id)
-          :type     :query
-          :query    {:source_table (id :checkins)
-                     :aggregation  ["count"]
-                     :filter       ["TIME_INTERVAL" (id :checkins :timestamp) "last" "week"]}})
-        :data :rows first first)))
+  (-> (with-temp-db [_ (checkins:1-per-day)]
+        (run-query checkins
+          (ql/aggregation (ql/count))
+          (ql/filter (ql/time-interval $timestamp :last :week))))
+      first-row first int))
+
+;; Make sure that when referencing the same field multiple times with different units we return the one
+;; that actually reflects the units the results are in.
+;; eg when we breakout by one unit and filter by another, make sure the results and the col info
+;; use the unit used by breakout
+(defn- date-bucketing-unit-when-you [& {:keys [breakout-by filter-by]}]
+  (let [results (with-temp-db [_ (checkins:1-per-day)]
+                  (run-query checkins
+                    (ql/aggregation (ql/count))
+                    (ql/breakout (ql/datetime-field $timestamp breakout-by))
+                    (ql/filter (ql/time-interval $timestamp :current filter-by))))]
+    {:rows (-> results :row_count)
+     :unit (-> results :data :cols first :unit)}))
+
+(expect-with-non-timeseries-dbs
+  {:rows 1, :unit :day}
+  (date-bucketing-unit-when-you :breakout-by "day", :filter-by "day"))
+
+(expect-with-non-timeseries-dbs
+  {:rows 7, :unit :day}
+  (date-bucketing-unit-when-you :breakout-by "day", :filter-by "week"))
+
+(expect-with-non-timeseries-dbs
+  {:rows 1, :unit :week}
+  (date-bucketing-unit-when-you :breakout-by "week", :filter-by "day"))
+
+(expect-with-non-timeseries-dbs
+  {:rows 1, :unit :quarter}
+  (date-bucketing-unit-when-you :breakout-by "quarter", :filter-by "day"))
+
+(expect-with-non-timeseries-dbs
+  {:rows 1, :unit :hour}
+  (date-bucketing-unit-when-you :breakout-by "hour", :filter-by "day"))
+
+
+;;; `not` filter -- Test that we can negate the various other filter clauses
+;; The majority of these tests aren't necessary since `not` automatically translates them to simpler, logically equivalent expressions
+;; but I already wrote them so in this case it doesn't hurt to have a little more test coverage than we need
+;; TODO - maybe it makes sense to have a separate namespace to test the Query eXpander so we don't need to run all these extra queries?
+
+;;; =
+(expect-with-non-timeseries-dbs [99] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/not (ql/= $id 1))))))
+
+;;; !=
+(expect-with-non-timeseries-dbs [1] (first-row (run-query venues
+                                                 (ql/aggregation (ql/count))
+                                                 (ql/filter (ql/not (ql/!= $id 1))))))
+;;; <
+(expect-with-non-timeseries-dbs [61] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/not (ql/< $id 40))))))
+
+;;; >
+(expect-with-non-timeseries-dbs [40] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/not (ql/> $id 40))))))
+
+;;; <=
+(expect-with-non-timeseries-dbs [60] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/not (ql/<= $id 40))))))
+
+;;; >=
+(expect-with-non-timeseries-dbs [39] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/not (ql/>= $id 40))))))
+
+;;; is-null
+(expect-with-non-timeseries-dbs [100] (first-row (run-query venues
+                                                   (ql/aggregation (ql/count))
+                                                   (ql/filter (ql/not (ql/is-null $id))))))
+
+;;; between
+(expect-with-non-timeseries-dbs [89] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/not (ql/between $id 30 40))))))
+
+;;; inside
+(expect-with-non-timeseries-dbs [39] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/not (ql/inside $latitude $longitude 40 -120 30 -110))))))
+
+;;; starts-with
+(expect-with-non-timeseries-dbs [80] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/not (ql/starts-with $name "T"))))))
+
+;;; contains
+(expect-with-non-timeseries-dbs [97] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/not (ql/contains $name "BBQ"))))))
+
+;;; does-not-contain
+;; This should literally be the exact same query as the one above by the time it leaves the Query eXpander, so this is more of a QX test than anything else
+(expect-with-non-timeseries-dbs [97] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/does-not-contain $name "BBQ")))))
+
+;;; ends-with
+(expect-with-non-timeseries-dbs [87] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/not (ql/ends-with $name "a"))))))
+
+;;; and
+(expect-with-non-timeseries-dbs [98] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/not (ql/and (ql/> $id 32)
+                                                                             (ql/contains $name "BBQ")))))))
+;;; or
+(expect-with-non-timeseries-dbs [31] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/not (ql/or (ql/> $id 32)
+                                                                            (ql/contains $name "BBQ")))))))
+
+;;; nested and/or
+(expect-with-non-timeseries-dbs [96] (first-row (run-query venues
+                                                  (ql/aggregation (ql/count))
+                                                  (ql/filter (ql/not (ql/or (ql/and (ql/> $id 32)
+                                                                                    (ql/< $id 35))
+                                                                            (ql/contains $name "BBQ")))))))
+
+;;; nested not
+(expect-with-non-timeseries-dbs [3] (first-row (run-query venues
+                                                 (ql/aggregation (ql/count))
+                                                 (ql/filter (ql/not (ql/not (ql/contains $name "BBQ")))))))
+
+;;; not nested inside and/or
+(expect-with-non-timeseries-dbs [1] (first-row (run-query venues
+                                                 (ql/aggregation (ql/count))
+                                                 (ql/filter (ql/and (ql/not (ql/> $id 32))
+                                                                    (ql/contains $name "BBQ"))))))

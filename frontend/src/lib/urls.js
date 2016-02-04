@@ -13,12 +13,27 @@ var Urls = {
         switch (model) {
             case "card":      return Urls.card(model_id);
             case "dashboard": return Urls.dashboard(model_id);
+            case "pulse":     return Urls.pulse(model_id);
             default:          return null;
         }
     },
 
-    tableRowsQuery: function(database_id, table_id) {
-        return "/q/?db="+database_id+"&table="+table_id;
+    pulse: function(pulse_id) {
+        return "/pulse/#"+pulse_id;
+    },
+
+    tableRowsQuery: function(database_id, table_id, metric_id, segment_id) {
+        let url = "/q/?db="+database_id+"&table="+table_id;
+
+        if (metric_id) {
+            url = url + "&metric="+metric_id;
+        }
+
+        if (segment_id) {
+            url = url + "&segment="+segment_id;
+        }
+
+        return url;
     }
 }
 

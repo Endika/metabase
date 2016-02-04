@@ -2,10 +2,7 @@
 
 import React, { Component, PropTypes } from "react";
 
-import ScalarCard from "./cards/ScalarCard.jsx";
-import TableCard from "./cards/TableCard.jsx";
-import ChartCard from "./cards/ChartCard.jsx";
-
+import Visualization from "metabase/visualizations/Visualization.jsx";
 import LoadingSpinner from "metabase/components/LoadingSpinner.jsx";
 
 import { fetchDashCardData, markNewCardSeen } from "../actions";
@@ -20,8 +17,7 @@ export default class DashCard extends Component {
 
     static propTypes = {
         dispatch: PropTypes.func.isRequired,
-        dashcard: PropTypes.object.isRequired,
-        visualizationSettingsApi: PropTypes.object.isRequired
+        dashcard: PropTypes.object.isRequired
     };
 
     async componentDidMount() {
@@ -62,11 +58,7 @@ export default class DashCard extends Component {
         }
 
         if (card && data) {
-            switch (card.display) {
-                case "table":  return <TableCard  className="flex-full" card={card} data={data} visualizationSettingsApi={this.props.visualizationSettingsApi} />;
-                case "scalar": return <ScalarCard className="flex-full" card={card} data={data} visualizationSettingsApi={this.props.visualizationSettingsApi} />;
-                default:       return <ChartCard  className="flex-full" card={card} data={data} visualizationSettingsApi={this.props.visualizationSettingsApi} />;
-            }
+            return <Visualization className="flex-full" card={card} data={data} isDashboard={true} />;
         }
 
         return (
@@ -90,7 +82,7 @@ export default class DashCard extends Component {
         return (
             <div className={"Card bordered rounded flex flex-column " + cx({ "Card--recent": recent })}>
                 <div className="Card-heading my1 px2">
-                    <a className="Card-title link" href={"/card/"+card.id+"?clone"}>
+                    <a data-metabase-event={"Dashboard;Card Link;"+card.display} className="Card-title link" href={"/card/"+card.id+"?clone"}>
                         <div ref="title" className="h3 text-normal my1">
                             {card.name}
                         </div>

@@ -72,6 +72,7 @@
 /* text weight */
 .text-light  { font-weight: 300; }
 .text-normal { font-weight: 400; }
+.text-strong { font-weight: 570; }
 .text-bold   { font-weight: 700; }
 
 /* text style */
@@ -93,4 +94,12 @@
 
 .text-underline {
     text-decoration: underline;;
+}
+
+.text-underline-hover:hover {
+    text-decoration: underline;;
+}
+
+.text-ellipsis {
+    text-overflow: ellipsis;
 }

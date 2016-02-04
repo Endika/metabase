@@ -26,7 +26,7 @@
                                                :email      (str user-name "@metabase.com")}))
 
 ;; ## GET /api/user
-;; Check that superusers can get a list of all active Users
+;; Check that anyone can get a list of all active Users
 (expect
     #{(match-$ (fetch-user :crowberto)
         {:common_name "Crowberto Corv"
@@ -60,11 +60,7 @@
     (let [user-ids (set (map user->id [:crowberto :rasta :lucky :trashbird]))]
       (cascade-delete User :id [not-in user-ids]))
     ;; Now do the request
-    (set ((user->client :crowberto) :get 200 "user")))) ; as a set since we don't know what order the results will come back in
-
-;; Check that non-superusers are denied access
-(expect "You don't have permissions to do that."
-  ((user->client :rasta) :get 403 "user"))
+    (set ((user->client :rasta) :get 200 "user")))) ; as a set since we don't know what order the results will come back in
 
 
 ;; ## POST /api/user
@@ -214,27 +210,20 @@
 
 ;; ## PUT /api/user/:id/password
 ;; Test that a User can change their password
-(let [user-last-name (random-name)]
-  (expect-eval-actual-first
-      (let [{user-id :id} (sel :one User :last_name user-last-name)]
-        (sel :one :fields [Session :id] :user_id user-id (k/order :created_at :desc))) ; get the latest Session for this User
-    (let [password {:old "password"
-                    :new "whateverUP12!!"}
-          {:keys [email id] :as user} (create-user :password (:old password) :last_name user-last-name)
-          creds {:old {:password (:old password)
-                       :email email}
-                 :new {:password (:new password)
-                       :email email}}]
-      ;; Check that creds work
-      (metabase.http-client/client :post 200 "session" (:old creds))
-      ;; Change the PW
-      (metabase.http-client/client (:old creds) :put 200 (format "user/%d/password" id) {:password (:new password)
-                                                                                         :old_password (:old password)})
-      ;; Old creds should no longer work
-      (assert (= (metabase.http-client/client :post 400 "session" (:old creds))
-                {:errors {:password "did not match stored password"}}))
-      ;; New creds *should* work
-      (metabase.http-client/client :post 200 "session" (:new creds)))))
+(expect-let [creds                 {:email    "abc@metabase.com"
+                                    :password "def"}
+             {:keys [id password]} (ins User
+                                     :first_name "test"
+                                     :last_name  "user"
+                                     :email      "abc@metabase.com"
+                                     :password   "def")]
+  true
+  (do
+    ;; use API to reset the users password
+    (metabase.http-client/client creds :put 200 (format "user/%d/password" id) {:password     "abc123!!DEF"
+                                                                                :old_password (:password creds)})
+    ;; now simply grab the lastest pass from the db and compare to the one we have from before reset
+    (not= password (sel :one :field [User :password] :email (:email creds)))))
 
 ;; Check that a non-superuser CANNOT update someone else's password
 (expect "You don't have permissions to do that."
@@ -262,3 +251,9 @@
 ;; Check that a non-superuser CANNOT update someone else's password
 (expect "You don't have permissions to do that."
   ((user->client :rasta) :delete 403 (format "user/%d" (user->id :rasta)) {}))
+
+
+;; ## POST /api/user/:id/send_invite
+;; Check that non-superusers are denied access to resending invites
+(expect "You don't have permissions to do that."
+  ((user->client :rasta) :post 403 (format "user/%d/send_invite" (user->id :crowberto))))

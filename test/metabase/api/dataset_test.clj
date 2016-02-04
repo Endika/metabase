@@ -3,11 +3,11 @@
   (:require [expectations :refer :all]
             [korma.core :as k]
             [metabase.db :refer :all]
+            [metabase.driver.query-processor.expand :as ql]
             [metabase.models.query-execution :refer [QueryExecution]]
             [metabase.test.data :refer :all]
             [metabase.test.data.users :refer :all]
-            [metabase.test.util :refer [match-$ expect-eval-actual-first]]
-            [metabase.test.util.q :refer [Q-expand]]))
+            [metabase.test.util :refer [match-$ expect-eval-actual-first]]))
 
 ;;; ## POST /api/meta/dataset
 ;; Just a basic sanity check to make sure Query Processor endpoint is still working correctly.
@@ -21,26 +21,28 @@
        :status    "completed"
        :id        $
        :uuid      $})
-  ((user->client :rasta) :post 200 "dataset" (Q-expand aggregate count of checkins)))
+  ((user->client :rasta) :post 200 "dataset" (ql/wrap-inner-query
+                                               (query checkins
+                                                 (ql/aggregation (ql/count))))))
 
 ;; Even if a query fails we still expect a 200 response from the api
 (expect-eval-actual-first
-  (match-$ (sel :one QueryExecution (k/order :id :desc))
-    {:data {:rows []
-            :cols []
-            :columns []}
-     :error "Syntax error in SQL statement \"FOOBAR[*] \"; expected \"FROM, {\""
-     :raw_query ""
-     :row_count 0
-     :result_rows 0
-     :status "failed"
-     :version 0
-     :json_query $
-     :started_at $
-     :finished_at $
-     :running_time $
-     :id $
-     :uuid $})
-  ((user->client :rasta) :post 200 "dataset" {:database (db-id)
-                                                   :type "native"
-                                                   :native {:query "foobar"}}))
+    (match-$ (sel :one QueryExecution (k/order :id :desc))
+      {:data         {:rows    []
+                      :cols    []
+                      :columns []}
+       :error        "Syntax error in SQL statement \"FOOBAR[*] \"; expected \"FROM, {\""
+       :raw_query    ""
+       :row_count    0
+       :result_rows  0
+       :status       "failed"
+       :version      0
+       :json_query   $
+       :started_at   $
+       :finished_at  $
+       :running_time $
+       :id           $
+       :uuid         $})
+    ((user->client :rasta) :post 200 "dataset" {:database (id)
+                                                :type     "native"
+                                                :native   {:query "foobar"}}))
